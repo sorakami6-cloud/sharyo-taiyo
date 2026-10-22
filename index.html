@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<script>
+// いちばん上のページ：社員用（app/）と整備工場用（shop/）を選ぶだけ。アプリとしては入らない（manifest を付けない）
+// 前のアドレスから来たときは、社員用の同じ画面へ移す（?view= などはそのまま付ける）
+//  ・前の index.html（index.html?view=pc など）
+//  ・前にホーム画面に入れた社員用アプリ（アプリとして開いたとき）
+(function () {
+  var p = location.pathname, q = location.search, h = location.hash;
+  var app = (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+  if (/\/index\.html$/.test(p) || /[?&]view=/.test(q) || app) location.replace("app/" + q + h);
+})();
+</script>
+<title>おまかせ車庫番</title>
+<meta name="theme-color" content="#2C4966">
+<link rel="icon" href="icons/favicon-32.png?v=2" sizes="32x32" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;700;900&display=swap">
+<style>
+:root{--bg:#EEF0EC;--paper:#FFFFFF;--ink:#1B222B;--mute:#5C6672;--line:#D9DDD6;--steel:#2C4966;--fix:#C8443A}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#171A1E;--paper:#22262C;--ink:#EEF0EC;--mute:#A3ABB5;--line:#3A4048}}
+:root[data-theme="dark"]{--bg:#171A1E;--paper:#22262C;--ink:#EEF0EC;--mute:#A3ABB5;--line:#3A4048}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Zen Kaku Gothic New","Hiragino Sans","Yu Gothic",system-ui,sans-serif;line-height:1.6}
+header{background:var(--steel);color:#fff;padding:18px 16px;text-align:center}
+header h1{margin:0;font-size:22px;font-weight:900;letter-spacing:.04em}
+main{max-width:520px;margin:0 auto;padding:24px 16px 40px;display:flex;flex-direction:column;gap:14px}
+main > p{margin:0;color:var(--mute);font-size:15px;text-align:center}
+.go{display:flex;align-items:center;gap:14px;padding:16px;border:1.5px solid var(--line);border-radius:16px;background:var(--paper);color:var(--ink);text-decoration:none;min-height:88px}
+.go img{width:56px;height:56px;border-radius:12px;flex:none}
+.go b{display:block;font-size:20px;font-weight:900}
+.go small{display:block;color:var(--mute);font-size:14px}
+.go span{flex:1;min-width:0}
+.go::after{content:"›";font-size:28px;color:var(--mute)}
+.go:hover,.go:focus-visible{border-color:var(--steel)}
+.go:focus-visible{outline:3px solid var(--steel);outline-offset:2px}
+.note{font-size:13px!important}
+</style>
+</head>
+<body>
+<header><h1>おまかせ車庫番</h1></header>
+<main>
+  <p>使う画面を選んでください</p>
+  <a class="go" href="app/"><img src="icons/icon-192.png?v=2" alt=""><span><b>社員用</b><small>スマホ版・PC版（予約・返却・修理・車検・点検）</small></span></a>
+  <a class="go" href="shop/"><img src="icons/shop-icon-192.png?v=1" alt=""><span><b>整備工場用</b><small>修理・車検で預かる車</small></span></a>
+  <p class="note">それぞれ、開いた画面からホーム画面に追加（アプリとして入れる）できます。<br>社員用と整備工場用は、別々のアプリとして入ります</p>
+</main>
+</body>
+</html>

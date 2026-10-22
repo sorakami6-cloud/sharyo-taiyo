@@ -1,0 +1,80 @@
+// service worker の中身（社員用 app/sw.js と整備工場用 shop/sw.js の両方から読む）
+// それぞれのフォルダの sw.js が、先に self.SW（保存の名前・保存するファイル・通知のアイコンなど）を決めてから、このファイルを読む
+// - アプリの画面（HTML/CSS/JS/アイコン）は「新しいものを優先、つながらないときは保存済みを使う」
+// - Firebase の SDK とフォントは一度読んだら保存済みを使う（版が固定のため）
+// - 車・修理の写真（Firebase Storage）は、一度表示したら端末に保存して次からはそこから出す（最大200枚、古い順に消す）
+//   写真を変えると写真のアドレスが変わるので、新しい写真は自動で取りに行く
+// - データ（Firestore）は Firebase が自分で処理するので、ここでは触らない
+// - プッシュ通知（Cloud Functions から Firebase Cloud Messaging で届く）を表示し、押したらアプリを開く
+const { cache: CACHE, prefix: PREFIX, shell: SHELL, icon: ICON, title: TITLE } = self.SW;
+const PHOTO_CACHE = "taiyo-photos-v1", PHOTO_MAX_ITEMS = 200; // 写真の置き場（2つのアプリで同じ。画面の版を上げても消さない）
+
+self.addEventListener("install", e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+});
+// 古い版の保存を消す（自分のアプリの分だけ。もう1つのアプリの保存と写真は消さない）
+self.addEventListener("activate", e => {
+  e.waitUntil(caches.keys()
+    .then(keys => Promise.all(keys.filter(k => k.startsWith(PREFIX) && k !== CACHE).map(k => caches.delete(k))))
+    .then(() => self.clients.claim()));
+});
+
+self.addEventListener("fetch", e => {
+  const req = e.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+
+  // 自分のサイト（GitHub Pages）: 新しいものを優先。つながらないときは保存済み（画面を開いたときは、このアプリのいちばん上）
+  if (url.origin === self.location.origin) {
+    e.respondWith(
+      fetch(req, { cache: "no-cache" }).then(res => {
+        if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
+        return res;
+      }).catch(() => caches.match(req, { ignoreSearch: true, cacheName: CACHE }).then(r => r || (req.mode === "navigate" ? caches.match("./", { cacheName: CACHE }) : undefined)))
+    );
+    return;
+  }
+  // 車・修理の写真（写真そのもの。alt=media）: 保存済みを優先。なければ取りに行って保存する
+  if (url.hostname === "firebasestorage.googleapis.com" && url.searchParams.get("alt") === "media" && /\/o\/(vehicles|repairs)%2F/.test(url.pathname)) {
+    e.respondWith(caches.open(PHOTO_CACHE).then(c => c.match(req).then(hit => hit || fetch(req).then(res => {
+      if (res.ok || res.type === "opaque") {
+        const copy = res.clone();
+        e.waitUntil(c.put(req, copy).then(() => c.keys()).then(keys => Promise.all(keys.slice(0, Math.max(0, keys.length - PHOTO_MAX_ITEMS)).map(k => c.delete(k)))));
+      }
+      return res;
+    }))));
+    return;
+  }
+  // Firebase SDK（www.gstatic.com/firebasejs/版番号/…）とフォント: 保存済みを優先
+  if ((url.hostname === "www.gstatic.com" && url.pathname.startsWith("/firebasejs/")) ||
+      url.hostname === "fonts.googleapis.com" || url.hostname === "fonts.gstatic.com") {
+    e.respondWith(
+      caches.match(req).then(hit => hit || fetch(req).then(res => {
+        if (res.ok || res.type === "opaque") { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
+        return res;
+      }))
+    );
+  }
+});
+
+// プッシュ通知：届いたら表示する（中身は data の title / body / tag / url）
+self.addEventListener("push", e => {
+  let p = {};
+  try { p = e.data ? e.data.json() : {}; } catch (err) { p = { data: { body: e.data ? e.data.text() : "" } }; }
+  const d = { ...(p.notification || {}), ...(p.data || {}) };
+  e.waitUntil(self.registration.showNotification(d.title || TITLE, {
+    body: d.body || "",
+    tag: d.tag || undefined, // 同じ通知は重ねない
+    icon: ICON,
+    data: { url: d.url || "./" },
+  }));
+});
+// 通知を押したら：このアプリの画面が開いていればそれを前に、なければこのアプリを開く（url はこのアプリのフォルダから見た場所）
+self.addEventListener("notificationclick", e => {
+  e.notification.close();
+  const url = new URL((e.notification.data && e.notification.data.url) || "./", self.registration.scope).href;
+  e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(list => {
+    const open = list.find(c => c.url.startsWith(self.registration.scope) && "focus" in c);
+    return open ? open.focus() : self.clients.openWindow(url);
+  }));
+});

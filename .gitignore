@@ -1,0 +1,20 @@
+.claude/
+Thumbs.db
+desktop.ini
+.DS_Store
+new-icons/
+# 実際の車のデータ（ナンバー入り）は公開リポジトリに入れない
+*.csv
+
+# Cloud Functions の部品（npm install で入る）
+functions/node_modules/
+*.log
+# 試作（見本）は公開しない
+shop-proto.html
+aki-chart.html
+yoyaku-range.html
+# お客さま向けに作った見本（お客さまの車番が入っている）は公開しない
+sankou-demo.html
+# 前の試作の画面と、作業の記録（前の会社の値が入っている）は公開しない
+sharyo-kanri-proto.html
+kiroku.md

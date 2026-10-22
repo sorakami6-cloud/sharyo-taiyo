@@ -1,0 +1,233 @@
+rules_version = '2';
+
+// 社用車管理アプリ Firestore ルール
+// - アプリを開いた人（匿名ログイン済み）だけが読み書きできる
+// - 決まった形のデータしか保存できない
+// - 車・予約・修理は消せない（廃車は retired: true で残す）。サンプルデータ（sample: true）だけは消せる
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function str(v, max) {
+      return v is string && v.size() > 0 && v.size() <= max;
+    }
+    function isDate(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+    function optStr(d, k, max) {
+      return !(k in d) || d[k] == null || (d[k] is string && d[k].size() <= max);
+    }
+    function optDate(d, k) {
+      return !(k in d) || d[k] == null || isDate(d[k]);
+    }
+    function isSample() {
+      return resource.data.get('sample', false) == true;
+    }
+    // サンプルの車に付いている予約・修理（試しに使ったときの記録）も消せるようにする
+    function onSampleVehicle() {
+      let path = /databases/$(database)/documents/vehicles/$(resource.data.vehicleId);
+      return exists(path) && get(path).data.get('sample', false) == true;
+    }
+
+    // ---- 車両 ----
+    function validVehicle(d) {
+      return d.keys().hasAll(['plateArea', 'plateClass', 'plateKana', 'plateNum', 'kind', 'type', 'shakenDate', 'homeLot', 'retired'])
+        && str(d.plateArea, 10)
+        && str(d.plateClass, 3)
+        && str(d.plateKana, 2)
+        && str(d.plateNum, 10)
+        && str(d.kind, 60)
+        && d.type in ['トラック', 'バン', '普通車']
+        && isDate(d.shakenDate)
+        && str(d.homeLot, 30)
+        && optStr(d, 'currentLot', 30)
+        && optStr(d, 'photoUrl', 2000)
+        && (!('status' in d) || d.status in ['free', 'use', 'fix'])
+        && (!('license' in d) || d.license in ['普通', '準中型5t', '準中型', '中型8t', '中型', '大型'])
+        && optStr(d, 'owner', 40)
+        && (!('hidden' in d) || d.hidden is bool)
+        && (!('inspection' in d) || d.inspection == null || validInspState(d.inspection))
+        && optDate(d, 'availDate')
+        && (!('shopWish' in d) || d.shopWish == null || validWish(d.shopWish))
+        && (!('airTank' in d) || d.airTank is bool)
+        && d.retired is bool;
+    }
+    // 整備工場の車検の希望日（取りに行きたい日）：日・入れた人・入れた時・どの満了日のための希望か
+    function validWish(x) {
+      return x is map && x.keys().hasOnly(['date', 'by', 'at', 'shaken'])
+        && isDate(x.date) && optStr(x, 'by', 60) && optDate(x, 'shaken')
+        && (!('at' in x) || x.at == null || x.at is timestamp);
+    }
+    // 車検中の印（vehicles の inspection）：出した日・戻り予定日（任意）・記録のID
+    function validInspState(x) {
+      return x is map && x.keys().hasOnly(['id', 'from', 'until'])
+        && isDate(x.from) && (!('until' in x) || x.until == null || isDate(x.until))
+        && optStr(x, 'id', 100);
+    }
+    match /vehicles/{vehicleId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && validVehicle(request.resource.data);
+      allow delete: if signedIn() && isSample();
+    }
+
+    // ---- 予約 ----
+    function validReservation(d) {
+      return d.keys().hasAll(['vehicleId', 'who', 'site', 'from', 'to'])
+        && str(d.vehicleId, 100)
+        && str(d.who, 40)
+        && str(d.site, 100)
+        && isDate(d.from) && isDate(d.to) && d.from <= d.to
+        && optStr(d, 'createdBy', 40)
+        && optStr(d, 'returnedLot', 30)
+        && (!('canceled' in d) || d.canceled is bool)
+        && optStr(d, 'canceledBy', 40);
+    }
+    match /reservations/{reservationId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && validReservation(request.resource.data);
+      allow delete: if signedIn() && (isSample() || onSampleVehicle());
+    }
+
+    // ---- 修理依頼 ----
+    function validRepair(d) {
+      return d.keys().hasAll(['vehicleId', 'status'])
+        && str(d.vehicleId, 100)
+        && d.status in ['open', 'in_repair', 'done']
+        && (!('symptoms' in d) || (d.symptoms is list && d.symptoms.size() <= 20))
+        && optStr(d, 'memo', 2000)
+        && (!('photoUrls' in d) || (d.photoUrls is list && d.photoUrls.size() <= 20))
+        && optStr(d, 'reportedBy', 40)
+        && optDate(d, 'availDate')
+        && (!('shop' in d) || d.shop == null || validShopHold(d.shop))
+        && (!('shopDone' in d) || d.shopDone == null || d.shopDone is map);
+    }
+    // 整備工場が修理で預かった：預かった日・戻せる予定の日・預かった人
+    function validShopHold(x) {
+      return x is map && isDate(x.from) && (!('until' in x) || x.until == null || isDate(x.until)) && optStr(x, 'by', 60);
+    }
+    match /repairs/{repairId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && validRepair(request.resource.data);
+      allow delete: if signedIn() && (isSample() || onSampleVehicle());
+    }
+
+    // ---- 車検の記録（車検に出す・戻す。あとで車屋さん用の画面で使う） ----
+    function validInspection(d) {
+      return d.keys().hasAll(['vehicleId', 'outDate'])
+        && str(d.vehicleId, 100)
+        && isDate(d.outDate)
+        && optDate(d, 'expectedBack') && optDate(d, 'backDate')
+        && optDate(d, 'oldShakenDate') && optDate(d, 'newShakenDate')
+        && optStr(d, 'outBy', 40) && optStr(d, 'backBy', 40) && optStr(d, 'returnedLot', 30);
+    }
+    match /inspections/{inspectionId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && validInspection(request.resource.data);
+      allow delete: if signedIn() && (isSample() || onSampleVehicle());
+    }
+
+    // ---- 点検（日常・1ヶ月点検）。1台1日に1つ（ID は「車のID_日付」） ----
+    // res：項目ごとの結果（ok／ng）、memo：問題ありの一言、meter：月末のメーター、confirmedBy：PCで確認した人（印）
+    function validCheck(d) {
+      return d.keys().hasAll(['vehicleId', 'date', 'res'])
+        && str(d.vehicleId, 100)
+        && isDate(d.date)
+        && d.res is map && d.res.size() <= 100
+        && (!('memo' in d) || (d.memo is map && d.memo.size() <= 100))
+        && (!('monthly' in d) || d.monthly is bool)
+        && (!('meter' in d) || d.meter == null || (d.meter is number && d.meter >= 0 && d.meter < 10000000))
+        && (!('confirmed' in d) || d.confirmed is bool)
+        && optStr(d, 'by', 40)
+        && optStr(d, 'confirmedBy', 40)
+        && optStr(d, 'repairId', 100);
+    }
+    match /checks/{checkId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && validCheck(request.resource.data);
+      allow delete: if signedIn() && (isSample() || onSampleVehicle());
+    }
+
+    // ---- 名簿（日報アプリと同じ形：名前・区分・所属・表示するか） ----
+    function validMember(d) {
+      return d.keys().hasAll(['name', 'kubun', 'active'])
+        && str(d.name, 30)
+        && d.kubun in ['自社', '常駐協力', '外注協力']
+        && optStr(d, 'shozoku', 30)
+        && d.active is bool;
+    }
+    match /members/{memberId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && validMember(request.resource.data);
+      // 消さない（隠すだけ。予約・修理の記録は名前で残る）。サンプルの人（sample: true）だけは消せる
+      allow delete: if signedIn() && isSample();
+    }
+
+    // ---- 設定（現場・駐車場のリスト、車検通知の日数など） ----
+    function validSettings(d) {
+      return (!('people' in d) || (d.people is list && d.people.size() <= 200))
+        && (!('sites' in d) || (d.sites is list && d.sites.size() <= 300))
+        && (!('lots' in d) || (d.lots is list && d.lots.size() >= 1 && d.lots.size() <= 5))
+        && (!('shakenAlertDays' in d) || (d.shakenAlertDays is int && d.shakenAlertDays >= 1 && d.shakenAlertDays <= 365))
+        && (!('checkOn' in d) || d.checkOn is bool)
+        && (!('checkItems' in d) || (d.checkItems is list && d.checkItems.size() <= 200));
+    }
+    // 通知を届ける人（PCの設定 → 通知）：通知の種類ごとに名前のリスト（wish：車検の希望日、avail：預けられる日が決まった）
+    function nameList(d, k) {
+      return !(k in d) || (d[k] is list && d[k].size() <= 500);
+    }
+    function validNotify(d) {
+      return d.keys().hasOnly(['shaken', 'due', 'overdue', 'repair', 'wish', 'avail', 'updatedAt'])
+        && nameList(d, 'shaken') && nameList(d, 'due') && nameList(d, 'overdue') && nameList(d, 'repair')
+        && nameList(d, 'wish') && nameList(d, 'avail');
+    }
+    match /settings/{docId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && (
+        (docId == 'app' && validSettings(request.resource.data))
+        || (docId == 'notify' && validNotify(request.resource.data)));
+    }
+
+    // ---- プッシュ通知 ----
+    // 本人がスマホでオフにした通知（off に入っている種類は届かない）
+    match /notifyPrefs/{prefId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn()
+        && request.resource.data.keys().hasOnly(['name', 'off', 'updatedAt'])
+        && str(request.resource.data.name, 40)
+        && request.resource.data.off is list && request.resource.data.off.size() <= 10;
+    }
+    // 通知を許可した端末（ID が通知トークン）。名前とひもづける。1人が複数の端末でもよい
+    // app: "shop" は整備工場のページ（通知を押すと shop.html が開く）
+    match /pushTokens/{token} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && token.size() <= 1000
+        && request.resource.data.keys().hasOnly(['name', 'platform', 'app', 'updatedAt'])
+        && str(request.resource.data.name, 40)
+        && (!('app' in request.resource.data) || request.resource.data.app in ['staff', 'shop'])
+        && optStr(request.resource.data, 'platform', 20);
+      allow delete: if signedIn();
+    }
+    // テスト通知の頼み（スマホの「🔔 通知」→「テスト通知を送る」）。書くのは「どの端末に」「だれが」「いつ」だけ
+    // 送るのと結果（result）を書き戻すのはサーバー（Cloud Functions）。アプリからは書き直し・削除はできない
+    match /pushTests/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['token', 'name', 'at'])
+        && str(request.resource.data.token, 1000)
+        && optStr(request.resource.data, 'name', 40)
+        && request.resource.data.at == request.time;
+    }
+    // 整備工場の人（専用ページで名前を入れた人）。PCの通知の設定に、整備工場の人として出す
+    match /shopUsers/{userId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn()
+        && request.resource.data.keys().hasOnly(['name', 'shop', 'updatedAt'])
+        && str(request.resource.data.name, 40) && optStr(request.resource.data, 'shop', 30);
+    }
+    // notifyLog（送った記録）は Cloud Functions だけが読み書きする
+
+    // それ以外はすべて禁止
+  }
+}
