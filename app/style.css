@@ -1,0 +1,1017 @@
+/* 社用車管理 — 見た目は sharyo-kanri-proto.html の CSS をそのまま使用。末尾に実機用・登録フォーム用を追加 */
+:root{
+  --bg:#EEF0EC; --paper:#FFFFFF; --ink:#1B222B; --mute:#5C6672; --line:#D9DDD6;
+  --steel:#2C4966; --steel-ink:#FFFFFF;
+  --free:#2E9E5B; --free-bg:#E3F5EA;
+  --use:#E08A1E; --use-bg:#FCEFD9;
+  --fix:#C8443A; --fix-bg:#F9E1DE;
+  --insp:#7A5BB5; --insp-bg:#EEE8F8; --insp-t:#6A4BA5; /* 車検中（紫） */
+  --plate:#F5F7F2; --plate-ink:#1B222B;
+  /* 文字・枠線に使う色（ライトモードは上と同じ。ダークモードだけ明るくして背景に沈まないようにする） */
+  --steel-t:var(--steel); --steel-t-ink:#FFFFFF; --use-deep:#8A4F00; --fix-deep:#9E2C24; --free-t:var(--free); --use-t:var(--use); --fix-t:var(--fix); --line-strong:var(--line);
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#171A1E; --paper:#22262C; --ink:#EEF0EC; --mute:#A3ABB5; --line:#3A4048;
+    --free-bg:#1E3A2A; --use-bg:#3E2E15; --fix-bg:#3F2220; --insp-bg:#2F2642; --insp-t:#C2ABF0; --plate:#F5F7F2;
+    --steel-t:#A9CBEF; --steel-t-ink:#16202B; --use-deep:#F2AE55; --fix-deep:#FF8F85; --free-t:#6BD197; --use-t:#F2AE55; --fix-t:#FF8F85; --line-strong:#6B7480;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#171A1E; --paper:#22262C; --ink:#EEF0EC; --mute:#A3ABB5; --line:#3A4048;
+  --free-bg:#1E3A2A; --use-bg:#3E2E15; --fix-bg:#3F2220; --insp-bg:#2F2642; --insp-t:#C2ABF0; --plate:#F5F7F2;
+  --steel-t:#A9CBEF; --steel-t-ink:#16202B; --use-deep:#F2AE55; --fix-deep:#FF8F85; --free-t:#6BD197; --use-t:#F2AE55; --fix-t:#FF8F85; --line-strong:#6B7480;
+}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Zen Kaku Gothic New","Hiragino Sans","Yu Gothic",system-ui,sans-serif;font-size:16px;line-height:1.5}
+button{font:inherit;color:inherit;cursor:pointer}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--paper);border:1.5px solid var(--line-strong);border-radius:10px;padding:12px 14px;font-size:17px;width:100%}
+input:focus,select:focus,textarea:focus,button:focus-visible{outline:3px solid var(--steel-t);outline-offset:2px}
+
+/* ---- preview switcher ---- */
+.switch{display:flex;justify-content:center;gap:8px;padding:14px 12px 6px}
+.switch button{border:1.5px solid var(--line);background:var(--paper);border-radius:999px;padding:8px 18px;font-weight:700}
+.switch button.on{background:var(--steel);color:#fff;border-color:var(--steel)}
+.note{text-align:center;color:var(--mute);font-size:13px;margin:0 0 10px}
+
+/* ---- phone frame ---- */
+.phone{width:min(392px,100%);margin:0 auto 40px;background:var(--paper);border-radius:28px;border:1.5px solid var(--line);overflow:hidden;display:flex;flex-direction:column;height:min(780px,92vh);position:relative}
+.phone header{background:var(--steel);color:var(--steel-ink);padding:14px 18px 12px;display:flex;align-items:center;gap:10px;min-height:58px}
+.phone header h1{font-size:20px;margin:0;font-weight:900;letter-spacing:.02em;flex:1}
+.phone header .today{font-size:14px;opacity:.85}
+.back{background:none;border:0;color:#fff;font-size:22px;padding:0 6px 0 0;line-height:1}
+.screen{flex:1;overflow:auto;padding:14px 14px 90px;-webkit-overflow-scrolling:touch}
+.tabs{position:absolute;left:0;right:0;bottom:0;display:flex;background:var(--paper);border-top:1.5px solid var(--line)}
+.tabs button{flex:1;background:none;border:0;padding:10px 0 12px;font-size:12px;color:var(--mute);display:flex;flex-direction:column;align-items:center;gap:2px}
+.tabs button .ic{font-size:22px;line-height:1}
+.tabs button.on{color:var(--steel-t);font-weight:700}
+.tabs button .badge{position:absolute;margin-left:34px;margin-top:-2px;background:var(--fix);color:#fff;border-radius:999px;font-size:11px;padding:1px 6px;font-weight:700}
+
+/* ---- chips ---- */
+/* 一覧の絞り込み2段：角丸の四角で、段ごとに横いっぱい均等（上3つ・下4つ）。選んでいる色は上下同じ */
+.chips{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:8px}
+.chips.types{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:14px}
+.chips .chip{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;column-gap:4px;min-width:0;min-height:48px;padding:4px 6px;border-radius:10px;border:1.5px solid var(--line-strong);background:var(--paper);color:var(--ink);font-size:16px;font-weight:700;line-height:1.2;white-space:nowrap;text-align:center}
+.chips .chip .n{margin-left:0;font-weight:500;opacity:.75}
+/* 下の段は少し控えめ（背景は薄いグレー、枠なし、文字小さめ） */
+.chips.types .chip{min-height:44px;padding:3px 4px;font-size:clamp(12px,3.7vw,14px);background:var(--bg);border-color:transparent}
+.chips .chip.on,.chips.types .chip.on{background:var(--steel-t);border-color:var(--steel-t);color:var(--steel-t-ink)}
+.chips .chip.on .n{opacity:.85}
+.chip{border:1.5px solid var(--line);background:var(--paper);border-radius:999px;padding:7px 14px;font-weight:700;font-size:14px}
+.chip.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.chip .n{opacity:.7;margin-left:4px;font-weight:500}
+
+/* ---- vehicle card ---- */
+.card{border:1.5px solid var(--line);border-radius:16px;overflow:hidden;background:var(--paper);margin-bottom:12px;text-align:left;width:100%;padding:0;display:block}
+.card .band{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 14px;color:#fff;font-weight:900;font-size:15px}
+.card .band .period{font-size:15px;font-weight:700;opacity:.95}
+.card .band .period small{font-size:12px;opacity:.85;margin-right:4px}
+.band.free{background:var(--free)} .band.use{background:var(--use)} .band.fix{background:var(--fix)}
+.card .body{display:flex;gap:12px;padding:12px 14px}
+.thumb{width:92px;height:68px;border-radius:10px;flex:none;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.thumb svg{width:78px;height:auto}
+.thumb img{width:100%;height:100%;object-fit:cover;border-radius:inherit}
+.photo-btn{margin-top:-2px;background:none;border:1.5px solid var(--line);border-radius:999px;padding:6px 14px;font-size:14px;font-weight:700;color:var(--mute)}
+.table .thumb{width:72px;height:50px;border-radius:8px}
+.table .thumb svg{width:60px}
+.plate{display:inline-block;background:var(--plate);color:var(--plate-ink);border:2px solid #333;border-radius:6px;padding:2px 10px;font-weight:900;font-size:18px;letter-spacing:.06em;line-height:1.3;white-space:nowrap}
+.plate small{display:block;font-size:11px;font-weight:700;letter-spacing:.1em;line-height:1.1}
+.meta{flex:1;min-width:0}
+.meta .kind{font-weight:700;margin-top:6px}
+.meta .r1{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-right:4px}
+.shk{display:inline-flex;flex-direction:column;align-items:center;line-height:1.15;flex:none;font-size:12px;font-weight:900;padding:4px 10px;border-radius:10px;background:var(--use-bg);color:var(--use-t);white-space:nowrap}
+.shk b{font-size:15px}
+.shk.over{background:var(--fix-bg);color:var(--fix-t)}
+.meta .who{color:var(--mute);font-size:14px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---- detail ---- */
+.hero{display:flex;flex-direction:column;align-items:center;gap:10px;padding:8px 0 14px}
+.hero .thumb{width:100%;height:190px}
+.hero .thumb svg{width:230px}
+.status-pill{display:inline-block;color:#fff;font-weight:900;padding:6px 16px;border-radius:999px;font-size:16px}
+.status-pill.free{background:var(--free)} .status-pill.use{background:var(--use)} .status-pill.fix{background:var(--fix)}
+.rows{border-top:1.5px solid var(--line)}
+.row{display:flex;justify-content:space-between;align-items:baseline;padding:12px 2px;border-bottom:1.5px solid var(--line);gap:10px}
+.row .k{color:var(--mute);font-size:14px;flex:none}
+.row .v{font-weight:700;text-align:right}
+.row .v.warn{color:var(--fix-t)}
+.actions{display:grid;gap:10px;margin:16px 0 6px}
+.btn{border:0;border-radius:14px;padding:16px;font-size:18px;font-weight:900;width:100%}
+.btn.primary{background:var(--steel);color:#fff}
+.btn.ghost{background:var(--paper);border:2px solid var(--steel-t);color:var(--steel-t)}
+.btn.danger{background:var(--fix-bg);color:var(--fix-t)}
+.btn.big{padding:22px;font-size:20px}
+.btn.free{background:var(--free);color:#fff}
+
+/* ---- calendar ---- */
+.cal{margin-top:16px}
+.cal h3{font-size:15px;margin:0 0 8px;font-weight:700}
+.cal .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.cal .d{aspect-ratio:1;display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:14px;background:var(--bg)}
+.cal .dow{background:none;color:var(--mute);font-size:12px;aspect-ratio:auto;padding:2px 0}
+.cal .d.use{background:var(--use);color:#fff;font-weight:700}
+.cal .d.today{outline:2px solid var(--ink);outline-offset:-2px;font-weight:900}
+.cal .d.blank{background:none}
+.legend{font-size:13px;color:var(--mute);margin-top:8px}
+.legend i{display:inline-block;width:12px;height:12px;background:var(--use);border-radius:3px;vertical-align:-1px;margin-right:4px}
+
+/* ---- forms ---- */
+.field{margin-bottom:14px}
+.field label{display:block;font-weight:700;margin-bottom:6px;font-size:15px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.opts{display:grid;gap:10px}
+.opt{border:2px solid var(--line);border-radius:14px;padding:18px;font-size:19px;font-weight:900;background:var(--paper);text-align:left;display:flex;align-items:center;justify-content:space-between}
+.opt.on{border-color:var(--steel);background:var(--steel);color:#fff}
+.sympt{display:flex;flex-wrap:wrap;gap:8px}
+.sympt .chip{font-size:15px;padding:10px 14px}
+.photo-box{border:2px dashed var(--line-strong);border-radius:14px;padding:22px;text-align:center;color:var(--mute);font-weight:700}
+.done{text-align:center;padding:40px 10px}
+.done .ok{width:84px;height:84px;border-radius:50%;background:var(--free);color:#fff;font-size:44px;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-weight:900}
+.done h2{margin:0 0 6px;font-size:22px}
+.done p{color:var(--mute);margin:0 0 24px}
+.me-pill{background:rgba(255,255,255,.18);border:0;color:#fff;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:700}
+.mine{display:flex;align-items:center;justify-content:space-between;border:2px solid var(--steel);background:var(--steel);color:#fff;border-radius:14px;padding:14px 16px;font-size:19px;font-weight:900}
+.mine .sw{background:rgba(255,255,255,.2);border:0;color:#fff;border-radius:999px;padding:6px 12px;font-size:13px;font-weight:700}
+.welcome{padding:10px 0}
+.welcome h2{font-size:22px;margin:0 0 4px}
+.sheet-title{font-size:20px;font-weight:900;margin:4px 0 14px}
+.sub{color:var(--mute);font-size:14px;margin:-8px 0 14px}
+
+/* ---- lists (shaken / repair) ---- */
+.li{display:flex;align-items:center;gap:12px;padding:12px 4px;border-bottom:1.5px solid var(--line)}
+.li .plate{font-size:15px}
+.li .grow{flex:1;min-width:0}
+.li .t{font-weight:700}
+.li .s{color:var(--mute);font-size:13px}
+.days{font-weight:900;font-size:15px;padding:6px 10px;border-radius:10px;background:var(--free-bg);color:var(--free-t);flex:none}
+.days.soon{background:var(--use-bg);color:var(--use-t)}
+.days.over{background:var(--fix-bg);color:var(--fix-t)}
+.tag{font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;background:var(--fix-bg);color:var(--fix-t)}
+.tag.done{background:var(--free-bg);color:var(--free-t)}
+
+/* ---- PC dashboard ---- */
+.pc{max-width:1180px;margin:0 auto 40px;padding:0 16px}
+.pc .top{display:flex;align-items:baseline;gap:16px;padding:10px 0 14px;flex-wrap:wrap}
+.pc .top h1{font-size:26px;margin:0;font-weight:900}
+.pc .top .today{color:var(--mute)}
+.counts{display:flex;gap:12px;margin-left:auto}
+.count{display:flex;align-items:baseline;gap:6px;padding:8px 16px;border-radius:12px;font-weight:900;font-size:22px}
+.count span{font-size:13px;font-weight:700}
+.count.free{background:var(--free-bg);color:var(--free-t)} .count.use{background:var(--use-bg);color:var(--use-t)} .count.fix{background:var(--fix-bg);color:var(--fix-t)}
+.grid2{display:grid;gap:16px}
+.stack{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}
+@media (max-width:900px){.stack{grid-template-columns:1fr}}
+.pc .li .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel{background:var(--paper);border:1.5px solid var(--line);border-radius:16px;overflow:hidden}
+.panel h2{font-size:16px;margin:0;padding:14px 18px;border-bottom:1.5px solid var(--line);font-weight:900;display:flex;justify-content:space-between;align-items:center}
+.panel h2 .tag{font-size:12px}
+.table{width:100%;border-collapse:collapse}
+.table th{font-size:13px;color:var(--mute);text-align:left;padding:10px 12px;font-weight:700;border-bottom:1.5px solid var(--line);white-space:nowrap}
+.table td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
+.table td.kind{font-weight:700}
+.panel.wide{overflow-x:auto}
+.table .days{display:inline-block}
+.table tr:last-child td{border-bottom:0}
+.dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px;vertical-align:-1px}
+.dot.free{background:var(--free)} .dot.use{background:var(--use)} .dot.fix{background:var(--fix)}
+.table .st{font-weight:900;white-space:nowrap}
+.table tr.grp td{padding:14px 14px 6px;font-weight:900;font-size:15px;border-bottom:0;border-left:5px solid transparent;background:var(--paper)}
+.table tr.grp.use td{color:var(--use-t);border-left-color:var(--use)} .table tr.grp.free td{color:var(--free-t);border-left-color:var(--free)} .table tr.grp.fix td{color:var(--fix-t);border-left-color:var(--fix)}
+.table tr.grp td span{font-size:13px;font-weight:700;opacity:.8;margin-left:8px}
+.table tr.grp td::before{content:"";display:inline-block;width:10px;height:10px;border-radius:50%;background:currentColor;margin-right:8px;vertical-align:1px}
+.table tr.vrow td:first-child{border-left:5px solid transparent}
+.table tr.vrow.use td:first-child{border-left-color:var(--use)} .table tr.vrow.free td:first-child{border-left-color:var(--free)} .table tr.vrow.fix td:first-child{border-left-color:var(--fix)}
+.table tr.vrow.use td{background:color-mix(in srgb,var(--use) 3%,var(--paper))} .table tr.vrow.free td{background:color-mix(in srgb,var(--free) 3%,var(--paper))} .table tr.vrow.fix td{background:color-mix(in srgb,var(--fix) 3%,var(--paper))}
+.table .plate{font-size:14px;padding:1px 8px}
+.pc .li{padding:12px 18px}
+.empty{padding:20px 18px;color:var(--mute);text-align:center}
+.pc .btn.small{padding:7px 12px;font-size:13px;border-radius:9px;width:auto}
+
+/* =====================================================================
+   ここから下は本番用の追加分（試作にない部分）
+   ===================================================================== */
+
+/* ---- スマホ実機: 枠なしで画面いっぱい。ステータスバー・ホームバーと重ならない ---- */
+@media (max-width:899px), (max-height:500px){
+  .switch{display:none}
+  .phone{position:fixed;inset:0;width:100%;height:auto;margin:0;border:0;border-radius:0}
+  .phone header{padding-top:calc(14px + env(safe-area-inset-top,0px));padding-left:max(18px,env(safe-area-inset-left,0px));padding-right:max(18px,env(safe-area-inset-right,0px))}
+  .screen{padding-left:max(14px,env(safe-area-inset-left,0px));padding-right:max(14px,env(safe-area-inset-right,0px));padding-bottom:calc(90px + env(safe-area-inset-bottom,0px))}
+  .tabs{padding-bottom:env(safe-area-inset-bottom,0px)}
+}
+.phone header h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.back{min-width:44px;min-height:44px;text-align:left}
+.tabs button{min-height:56px}
+.chip{min-height:40px}
+.card{cursor:pointer}
+.loading{padding:40px 18px;color:var(--mute);text-align:center}
+.errbar{background:var(--fix-bg);color:var(--fix-t);font-weight:700;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:14px}
+.pc .errbar{margin:0 0 16px}
+
+/* ---- PC: 表の行を押すと修正 ---- */
+.btn.small{padding:7px 12px;font-size:13px;border-radius:9px;width:auto;min-height:36px}
+.table tr.vrow{cursor:pointer}
+.table tr.vrow:hover td{background:color-mix(in srgb,var(--steel-t) 8%,var(--paper))}
+.retired summary{font-size:15px;font-weight:900;padding:14px 18px;cursor:pointer;color:var(--mute)}
+.retired[open] summary{border-bottom:1.5px solid var(--line)}
+.retired .table td{color:var(--mute)}
+.sample-note{color:var(--mute);font-size:13px;text-align:right;margin:4px 2px 0}
+.linkbtn{background:none;border:0;padding:4px 2px;color:var(--steel-t);text-decoration:underline;font-size:13px;font-weight:700}
+
+/* ---- 車両の登録・修正（PCのみ） ---- */
+.overlay{position:fixed;inset:0;background:rgba(15,20,26,.45);display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;z-index:50}
+.modal{width:min(560px,100%)}
+.modal h2 .x{background:none;border:0;font-size:26px;line-height:1;color:var(--mute);min-width:44px;min-height:44px;margin:-10px -12px -10px 0}
+.modal .mbody{padding:18px}
+.modal .mfoot{display:flex;gap:10px;align-items:center;padding:14px 18px;border-top:1.5px solid var(--line)}
+.modal .mfoot .sp{flex:1}
+.modal .mfoot .btn{padding:12px 20px;font-size:16px;border-radius:12px;width:auto}
+.plate-in{display:grid;grid-template-columns:1.3fr 1fr .8fr 1.4fr;gap:8px}
+.plate-in input{text-align:center;padding:12px 6px}
+.hint{color:var(--mute);font-size:13px;margin-top:4px}
+.seg{display:flex;gap:8px;flex-wrap:wrap}
+.seg label.chip{display:inline-flex;align-items:center;min-height:44px;margin:0;padding:8px 18px;font-size:15px;position:relative;cursor:pointer}
+.seg input{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}
+.seg label.chip:has(input:checked){background:var(--steel);color:#fff;border-color:var(--steel)}
+.seg label.chip:has(input:focus-visible){outline:3px solid var(--steel-t);outline-offset:2px}
+.ferr{color:var(--fix-t);font-weight:700;font-size:14px;margin:0 0 12px}
+
+/* ---- お知らせ（画面下にふわっと出る） ---- */
+.toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:12px 18px;border-radius:12px;font-weight:700;font-size:15px;z-index:60;max-width:calc(100% - 32px);box-shadow:0 6px 20px rgba(0,0,0,.2)}
+
+/* ---- 写真（段階3） ---- */
+.photo-btn{display:inline-flex;align-items:center;gap:4px;min-height:44px;cursor:pointer}
+.photo-pick{display:flex;align-items:center;gap:14px}
+.photo-pick .thumb{width:120px;height:84px}
+.photo-pick .thumb svg{width:96px}
+
+/* ---- 修理依頼（段階4） ---- */
+.tag.inrep{background:var(--use-bg);color:var(--use-t)}
+.photo-box{display:block;cursor:pointer;min-height:44px}
+.rphotos{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+.rphoto{position:relative;aspect-ratio:4/3;border-radius:10px;overflow:hidden;background:var(--bg)}
+.rphoto img{width:100%;height:100%;object-fit:cover;display:block}
+.rphoto .rm{position:absolute;top:4px;right:4px;width:32px;height:32px;border-radius:50%;border:0;background:rgba(0,0,0,.6);color:#fff;font-size:18px;line-height:1;padding:0}
+.rphoto .rm::after{content:"";position:absolute;inset:-6px}
+.btn:disabled{opacity:.7;cursor:default}
+.rbtns{display:flex;flex-direction:column;gap:6px;flex:none;align-items:stretch}
+.rthumbs{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.rthumbs img{width:56px;height:42px;object-fit:cover;border-radius:6px;display:block}
+.pc .li .t .tag{vertical-align:1px}
+.pc .rpanel .li{align-items:flex-start}
+.pc .rpanel .li .t{white-space:normal;overflow:visible}
+/* せまいときは、ボタンを説明の下に回す（説明が1文字ずつの縦長にならないように） */
+.pc .rpanel .li{flex-wrap:wrap}
+.pc .rpanel .li .grow{min-width:150px}
+.pc .rpanel .rbtns{margin-left:auto}
+
+/* ---- 段階5: 車検一覧・設定 ---- */
+.li.tap{cursor:pointer}
+.pc .top .btn.small{align-self:center}
+.lots-in{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+.days-in{display:flex;align-items:center;gap:10px}
+.days-in input{width:120px}
+.days-in span{font-weight:700}
+.modal textarea{resize:vertical;line-height:1.6}
+
+/* ---- 名簿（日報アプリと同じ選び方） ---- */
+.nsearch{margin:0 0 14px}
+.mgroup{font-weight:900;font-size:15px;color:var(--mute);margin:14px 0 8px;display:flex;align-items:baseline;gap:8px}
+.mgroup span{font-size:12px;font-weight:700}
+.ngrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.nchip{min-height:56px;padding:0 6px;background:var(--paper);border:1.5px solid var(--line-strong);border-radius:12px;font-size:17px;font-weight:700;line-height:1.2;word-break:break-all}
+.nchip.on{background:var(--steel);border-color:var(--steel);color:#fff}
+.picker{border:1.5px solid var(--line);border-radius:14px;padding:12px}
+.picker .mgroup:first-child{margin-top:0}
+/* 設定画面の名簿 */
+.modal{width:min(720px,100%)}
+.mtools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.mtools input{flex:1;min-width:180px}
+.mlist{max-height:360px;overflow:auto;border:1.5px solid var(--line);border-radius:12px;padding:0 12px 10px;margin-top:10px}
+.mcount{font-size:13px;color:var(--mute);padding-top:10px}
+.mrow{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
+.mrow b{min-width:7em}
+.mrow .mso{flex:1;color:var(--mute);font-size:14px}
+.mrow.off b,.mrow.off .mso{opacity:.5}
+.madd{display:grid;grid-template-columns:1.2fr 1fr 1.4fr auto;gap:8px;margin-top:10px}
+@media (max-width:600px){.madd{grid-template-columns:1fr 1fr}}
+
+/* ---- スマホ幅に収める（横にはみ出して画面がふわふわ動かないように） ---- */
+/* 画面全体は横に動かさない（指での拡大はそのままできる） */
+html,body{overflow-x:hidden;overscroll-behavior-x:none}
+.screen{overflow-x:hidden;overscroll-behavior-x:none}
+/* 入力欄は親の幅より広がらない。iPhone の日付・検索欄は独自の最小幅を持つので見た目をそろえる */
+input,select,textarea{min-width:0;max-width:100%}
+input[type="date"],input[type="search"]{-webkit-appearance:none;appearance:none;display:block}
+input[type="date"]{min-height:52px;text-align:left}
+input[type="date"]::-webkit-date-and-time-value{text-align:left}
+input[type="search"]::-webkit-search-decoration{-webkit-appearance:none}
+/* 横に並べる欄・ボタンは、中身が長くても列の幅に収める */
+.two{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.two > *,.ngrid > *,.rphotos > *,.lots-in > *,.madd > *{min-width:0}
+.ngrid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.nchip{overflow:hidden;overflow-wrap:anywhere;word-break:normal}
+/* 長い文は折り返す */
+.ferr,.errbar,.sub,.legend,.sheet-title,.done h2,.done p,.welcome h2,.row .v,.li .t,.li .s,.empty,.toast,.mgroup{overflow-wrap:anywhere;min-width:0}
+.row .v{min-width:0}
+.mine span{min-width:0;overflow-wrap:anywhere}
+.opt{min-width:0;overflow-wrap:anywhere}
+/* ヘッダー：長い名前でも右にはみ出さない */
+.phone header .today{flex:none;white-space:nowrap}
+.me-pill{flex:none;max-width:38vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---- 下のタブ：アイコンと文字を真ん中に、iPhone のホームバーに重ならず余白は控えめ ---- */
+:root{--sab:env(safe-area-inset-bottom,0px)} /* iPhone の下の余白（ホームバーのぶん） */
+.tabs button{position:relative;justify-content:center;min-height:60px;padding:6px 0;gap:3px;font-size:13px;line-height:1.1}
+.tabs button .ic{font-size:26px}
+.tabs button .badge{top:5px;left:50%;margin:0 0 0 8px;min-width:20px;text-align:center;font-size:12px;padding:1px 6px}
+@media (max-width:899px), (max-height:500px){
+  /* ホームバーは下から約13px。その上に文字が来るよう、余白は iPhone の値から10px減らす（最低6px） */
+  .tabs{padding-bottom:max(6px,calc(var(--sab) - 10px))}
+  .screen{padding-bottom:calc(84px + var(--sab))}
+  .toast{bottom:calc(84px + var(--sab))}
+  /* 画面の枠のすき間に地の色が見えても、上はヘッダー・下はタブと同じ色でつながるように */
+  :root{padding:0;background:linear-gradient(var(--steel) 50%,var(--paper) 50%)}
+  body{background:transparent}
+}
+
+/* スマホ：画面の端でページ全体が引っぱられて、下のタブまで一緒に動かないように（一覧のスクロールはそのまま） */
+@media (max-width:899px), (max-height:500px){
+  html,body{overscroll-behavior:none}
+  .screen{overscroll-behavior-y:contain}
+}
+
+/* ---- PC：全車両の絞り込み・グループの開閉、上のパネルの「ほか○件を表示」 ---- */
+.pcfilter{padding:14px 14px 2px;max-width:760px}
+.chips.four{grid-template-columns:repeat(4,minmax(0,1fr))}
+.table tr.grp{cursor:pointer;user-select:none}
+.table tr.grp:hover td,.table tr.grp:focus-visible td{background:color-mix(in srgb,var(--steel-t) 7%,var(--paper))}
+.table tr.grp:focus-visible{outline:3px solid var(--steel-t);outline-offset:-3px}
+.table tr.grp .caret{display:inline-block;width:1.3em;font-size:12px}
+.table tr.grp.closed td{padding-bottom:14px;border-bottom:1px solid var(--line)}
+.more{display:block;width:100%;min-height:52px;padding:14px;border:0;border-top:1.5px solid var(--line);background:var(--paper);color:var(--steel-t);font-size:17px;font-weight:900;cursor:pointer}
+.more:hover{background:color-mix(in srgb,var(--steel-t) 7%,var(--paper))}
+.tag.plain{background:var(--bg);color:var(--mute)}
+
+/* 返却：駐車場が4つ以上のときはボタンを少し詰めて、スマホの1画面に収める */
+.opts.compact{gap:8px}
+.opts.compact .opt{padding:13px 18px;font-size:18px}
+
+/* ---- 専用・必要な免許の札、一時的に隠す ---- */
+.vtags{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.vtag{display:inline-block;font-size:12px;font-weight:700;line-height:1.4;padding:2px 7px;border-radius:6px;white-space:nowrap}
+.vtag.own{background:color-mix(in srgb,var(--steel-t) 14%,var(--paper));color:var(--steel-t)}
+.vtag.lic{background:var(--use-bg);color:var(--use-t);cursor:help}
+.hero .vtags{justify-content:center;margin-top:0}
+.licnote{font-size:12px;font-weight:500;color:var(--mute);margin-top:2px;line-height:1.5}
+.licwarn{background:var(--use-bg);color:var(--use-t);border-radius:12px;padding:10px 12px;font-weight:900;font-size:15px;margin:0 0 14px}
+.licwarn small{display:block;margin-top:4px;font-size:13px;font-weight:500;color:var(--ink);line-height:1.5}
+.ownnote{text-align:center;color:var(--mute);font-weight:700;margin:4px 0}
+.table td.kind .vtags{margin-top:3px}
+
+/* ---- スマホ：自分が使用中の車の帯（返し忘れ防止） ---- */
+.mybar{display:grid;gap:8px;margin:0 0 14px}
+.myuse{border-radius:14px;background:var(--use-bg);border:2px solid var(--use);padding:10px 12px;min-width:0}
+.myuse.over{background:var(--fix-bg);border-color:var(--fix)}
+.mu-head{font-size:13px;font-weight:900;color:var(--use-deep);margin-bottom:4px}
+.myuse.over .mu-head{color:var(--fix-deep)}
+.mu-body{display:flex;align-items:center;gap:10px;min-width:0}
+.mu-info{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.35}
+.mu-info b{font-size:17px;font-weight:900;overflow-wrap:anywhere}
+.mu-plate{font-size:13px;color:var(--mute);overflow-wrap:anywhere}
+.mu-to{font-size:15px;font-weight:700}
+.myuse.over .mu-to{color:var(--fix-deep)}
+.mu-btn{flex:none;min-height:48px;padding:0 16px;border:0;border-radius:12px;background:var(--steel-t);color:var(--steel-t-ink);font-size:16px;font-weight:900}
+.myuse.over .mu-btn{background:var(--fix);color:#fff}
+.mynext{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:40px;padding:6px 12px;border:1.5px solid var(--line-strong);border-radius:10px;background:var(--paper);color:var(--ink);font-size:14px;font-weight:700;text-align:left;overflow-wrap:anywhere}
+.mynext span{color:var(--mute);flex:none}
+
+/* ---- 返却予定を過ぎた車（使用中・返却待ち） ---- */
+.band.use.over,.status-pill.use.over{background:var(--fix)}
+.tag.overdue{background:var(--fix);color:#fff;font-weight:900;white-space:nowrap}
+.table tr.grp td .tag.overdue{font-size:12px;margin-left:10px;opacity:1}
+.table tr.vrow.over td:first-child{border-left-color:var(--fix)}
+.table td .s{color:var(--mute)}
+.table td .s.overdue-s{color:var(--fix-deep);font-weight:700}
+/* 詳細の行の中の赤い文字（修理の内容・車検・返却予定を過ぎた日） */
+.row .v .warn{color:var(--fix-t)}
+
+/* ---- 写真：読み込み中の見本、失敗のお知らせ、送信中のボタン ---- */
+.loading-thumb{font-size:12px;color:var(--mute);text-align:center;padding:6px}
+.toast.err{background:var(--fix);color:#fff}
+.photo-btn.busy{cursor:default;color:var(--steel-t);border-color:var(--steel-t)}
+
+/* ---- 写真：詳細・フォームの見本は切らずに全部見せる（枠を写真の形に合わせる） ---- */
+.hero .thumb.has-photo{width:auto;max-width:100%;height:auto;background:none;padding:0}
+.hero .thumb.has-photo img{display:block;width:auto;height:auto;max-width:100%;max-height:50vh;max-height:50dvh;object-fit:contain;border-radius:12px}
+.photo-pick .thumb img{object-fit:contain}
+.thumb.zoomable{cursor:zoom-in}
+.thumb.zoomable:focus-visible{outline:3px solid var(--steel-t);outline-offset:2px}
+/* 写真を見る画面（画面いっぱい） */
+.viewer{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.92);display:flex;align-items:center;justify-content:center;touch-action:none;overscroll-behavior:contain;user-select:none;-webkit-user-select:none}
+.viewer img{max-width:100vw;max-height:100vh;max-height:100dvh;object-fit:contain;transform-origin:center center;will-change:transform;cursor:zoom-in;-webkit-user-drag:none}
+.viewer .vclose{position:absolute;top:calc(10px + env(safe-area-inset-top,0px));right:calc(10px + env(safe-area-inset-right,0px));width:48px;height:48px;border-radius:50%;border:0;background:rgba(255,255,255,.18);color:#fff;font-size:28px;line-height:1;cursor:pointer}
+
+/* ---- PCの車両の修正・追加：写真をいちばん上に大きく（切らずに全部。高さは画面の4割まで） ---- */
+.mhero{display:flex;flex-direction:column;align-items:center;gap:10px;padding:2px 0 16px;margin-bottom:14px;border-bottom:1.5px solid var(--line)}
+.mhero-img{display:flex;align-items:center;justify-content:center;max-width:100%}
+.mhero-img img{display:block;width:auto;height:auto;max-width:100%;max-height:40vh;object-fit:contain;border-radius:12px}
+.mhero-img.empty{width:100%;height:200px;background:var(--bg);border-radius:12px;color:var(--mute);font-size:14px}
+.mhero-img.empty svg{width:230px;height:auto}
+.mhero-img.zoomable{cursor:zoom-in}
+.mhero-img.zoomable:focus-visible{outline:3px solid var(--steel-t);outline-offset:2px}
+.mhero #f-prev{width:100%;display:flex;justify-content:center}
+
+/* ---- 専用の車（使っていないとき）：グレー ---- */
+:root{--own:#6B7480}
+.band.own,.status-pill.own{background:var(--own)}
+.dot.own{background:var(--own)}
+.table tr.grp.own td{color:var(--mute);border-left-color:var(--own)}
+.table tr.vrow.own td:first-child{border-left-color:var(--own)}
+.table tr.vrow.own td{background:color-mix(in srgb,var(--own) 4%,var(--paper))}
+
+/* ---- 絞り込みの「専用」タブ：上の段を4つ（PCは5つ）に。本人の専用車は紺の「あなた専用」 ---- */
+.chips.five{grid-template-columns:repeat(5,minmax(0,1fr))}
+#ph-screen .chips.four:not(.types) .chip{font-size:clamp(13px,4vw,16px);padding:4px 3px}
+.band.mine,.status-pill.mine{background:var(--steel)}
+
+/* ---- 月の切り替えボタン（車の詳細のカレンダー） ---- */
+.pcal-nav{width:44px;height:44px;border:1.5px solid var(--line-strong);border-radius:10px;background:var(--paper);font-size:22px;line-height:1}
+.pcal-nav:disabled{opacity:.35;cursor:default}
+/* ---- この車の予約（取り消し） ---- */
+.reslist{margin-top:16px}
+.reslist h3{font-size:15px;margin:0 0 6px;font-weight:700}
+.resrow{display:flex;align-items:center;gap:10px;padding:8px 2px;border-bottom:1px solid var(--line)}
+.resrow .grow{min-width:0;display:flex;flex-direction:column}
+.resrow span{color:var(--mute);font-size:13px;overflow-wrap:anywhere}
+.mynext-row{display:flex;gap:8px;align-items:stretch}
+.mynext-row .mynext{flex:1;min-width:0}
+.mu-cancel{flex:none;min-height:40px;padding:0 12px;border:1.5px solid var(--line-strong);border-radius:10px;background:var(--paper);color:var(--ink);font-size:13px;font-weight:700}
+
+/* 車の詳細のカレンダー：月の切り替え */
+.cal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.cal-head h3{margin:0}
+/* 車の詳しい画面のカレンダー：今日から先の日は押せる（空き＝予約、オレンジ＝誰が使うか） */
+.cal button.d{border:0;padding:0;font:inherit;font-size:14px;color:var(--ink);cursor:pointer;width:100%;min-width:0}
+.cal button.d.use,.cal .d.insp,.cal .d.fix{color:#fff;font-weight:700}
+.cal .d.insp{background:var(--insp)} .cal .d.fix{background:var(--fix)}
+.cal button.d:focus-visible{outline:3px solid var(--steel-t);outline-offset:1px}
+@media (hover:hover){.cal button.d:not(.use):not(.insp):not(.fix):hover{background:color-mix(in srgb,var(--free) 22%,var(--bg))}}
+.legend i.insp{background:var(--insp)} .legend i.fix{background:var(--fix)}
+.cal-note{margin:6px 0 0;font-size:13px;color:var(--mute)}
+.latewarn{margin:0 0 10px;padding:8px 12px;border-radius:10px;background:var(--fix-bg);color:var(--fix-t);font-size:14px;font-weight:700;overflow-wrap:anywhere}
+
+/* ---- 通知 ---- */
+/* スマホ：右上の名前を押したメニュー */
+.phone header{position:relative}
+.me-menu{position:absolute;right:12px;top:calc(100% - 6px);z-index:20;background:var(--paper);color:var(--ink);border:1.5px solid var(--line-strong);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.18);overflow:hidden;min-width:168px}
+.me-menu button{display:block;width:100%;text-align:left;background:none;border:0;padding:0 16px;min-height:48px;font-size:16px;font-weight:700}
+.me-menu button+button{border-top:1px solid var(--line)}
+/* 車両一覧のいちばん上：通知をオンにする */
+.pushbtn{display:block;width:100%;min-height:52px;margin:0 0 14px;border:2px solid var(--steel-t);border-radius:14px;background:var(--paper);color:var(--steel-t);font-size:17px;font-weight:900}
+.pushnote{margin:0 0 14px;color:var(--mute);font-size:14px;text-align:center;overflow-wrap:anywhere}
+/* スマホの「🔔 通知」：オン・オフのスイッチ */
+.nsw-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:60px;padding:6px 4px;border-bottom:1.5px solid var(--line);font-size:17px;font-weight:700;cursor:pointer}
+.switch-in{appearance:none;-webkit-appearance:none;flex:none;width:52px;height:32px;padding:0;border:0;border-radius:999px;background:var(--line-strong);position:relative;cursor:pointer;transition:background .15s}
+.switch-in::after{content:"";position:absolute;top:3px;left:3px;width:26px;height:26px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:transform .15s}
+.switch-in:checked{background:var(--free)}
+.switch-in:checked::after{transform:translateX(20px)}
+/* PC：設定のタブ */
+.stabs{display:flex;gap:4px;padding:0 18px;border-bottom:1.5px solid var(--line)}
+.stabs button{background:none;border:0;border-bottom:3px solid transparent;margin-bottom:-1.5px;padding:10px 18px;font-weight:700;color:var(--mute)}
+.stabs button.on{color:var(--steel-t);border-bottom-color:var(--steel-t)}
+/* PC：設定 → 通知（人ごとのオン・オフの表） */
+.ntable-wrap{max-height:56vh;overflow:auto;border:1.5px solid var(--line);border-radius:12px;margin-top:10px}
+.ntable{width:100%;border-collapse:collapse;font-size:14px}
+.ntable th{position:sticky;top:0;z-index:1;background:var(--paper);border-bottom:1.5px solid var(--line);padding:8px 6px;font-size:14px;text-align:center;vertical-align:top;white-space:nowrap}
+.ntable th:first-child{text-align:left;vertical-align:bottom;padding-left:12px}
+.ntable th small{display:block;font-weight:500;color:var(--mute);font-size:12px}
+.ntable .nall{display:flex;flex-direction:column;align-items:center;gap:4px;margin-top:6px}
+.ntable th:not(:first-child){white-space:normal;min-width:84px} /* 長い見出し（預けられる日が決まった）は2行に */
+.ntable .nall .btn.small{padding:4px 7px;font-size:12px;min-height:28px;border-width:1.5px}
+.ntable td{padding:6px;border-bottom:1px solid var(--line);text-align:center}
+.ntable td.nname{text-align:left;padding-left:12px;white-space:nowrap}
+.ntable td.nname b{margin-right:8px}
+.ntable input[type=checkbox]{width:22px;height:22px;padding:0;cursor:pointer;accent-color:var(--steel)}
+.ntable tr.ngrp td{text-align:left;font-weight:900;color:var(--mute);background:var(--bg);padding:4px 12px;font-size:13px}
+.pst{font-size:11px;color:var(--mute);border:1px solid var(--line-strong);border-radius:6px;padding:1px 6px;font-weight:700}
+.pst.ok{color:var(--free-t);border-color:var(--free-t)}
+/* 通知がオンなのに未許可の人（何も届かない）は赤で目立たせる。許可済みの人は端末と登録した日 */
+.pst.ng{color:#fff;background:var(--fix);border-color:var(--fix)}
+.ntable tr.nng td.nname{background:var(--fix-bg)}
+.pdate{display:block;font-size:11px;color:var(--mute);margin-top:2px}
+.nsum{padding:8px 12px;font-size:13px;border-bottom:1.5px solid var(--line);background:var(--bg)}
+.nsum b{color:var(--fix-t)}
+/* スマホの「🔔 通知」：この端末の登録の状態とテスト通知 */
+.pstatus{border-radius:12px;padding:10px 12px;margin:0 0 10px;border:1.5px solid var(--line-strong);overflow-wrap:anywhere}
+.pstatus b{display:block;font-size:15px}
+.pstatus small{display:block;margin-top:4px;font-size:12px;color:var(--mute)}
+.pstatus.ok{background:var(--free-bg);border-color:var(--free)} .pstatus.ok b{color:var(--free-t)}
+.pstatus.ng{background:var(--fix-bg);border-color:var(--fix)} .pstatus.ng b{color:var(--fix-t)}
+.btn.ptest{padding:12px;font-size:16px;margin:0 0 14px}
+#sform.modal{width:min(960px,100%)} /* 通知の表（6種類）が横に収まるよう、設定だけ広く */
+
+/* ---- 車検中（紫） ---- */
+.band.insp,.status-pill.insp{background:var(--insp)}
+.dot.insp{background:var(--insp)}
+.count.insp{background:var(--insp-bg);color:var(--insp-t)}
+.days.insp{background:var(--insp-bg);color:var(--insp-t)}
+.table tr.grp.insp td{color:var(--insp-t);border-left-color:var(--insp)}
+.table tr.vrow.insp td:first-child{border-left-color:var(--insp)}
+.table tr.vrow.insp td{background:color-mix(in srgb,var(--insp) 4%,var(--paper))}
+.chips.six{grid-template-columns:repeat(6,minmax(0,1fr))}
+.insnote{font-size:14px;color:var(--insp-t);font-weight:700;margin-top:4px}
+.btn.insp{background:var(--insp-bg);color:var(--insp-t)}
+/* PC：車検に出す・戻す の小さな画面 */
+.imodal.modal{width:min(480px,100%)}
+.ihead{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.shk-in{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.shk-in input{flex:1;min-width:170px;width:auto}
+.shk-now{color:var(--mute);font-size:13px;width:100%}
+.iclash{background:var(--use-bg);border-radius:12px;padding:12px 14px;font-size:14px}
+.iclash b{display:block;color:var(--use-deep);margin-bottom:4px}
+.iclash div{padding:2px 0;overflow-wrap:anywhere}
+.iclash p{margin:8px 0 0;font-weight:700}
+.me-ver{padding:6px 16px 8px;border-top:1px solid var(--line);font-size:11px;color:var(--mute);text-align:right}
+/* ---- 整備工場 ---- */
+.insnote.shopnote,.s.shopnote{color:var(--steel-t);font-weight:700}
+/* PC：車の修正画面の上の「車検中・修理中」と、間違えたとき用の取り消しボタン */
+.undo-box{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;border-radius:12px;padding:10px 14px;margin-bottom:14px;font-size:14px;background:var(--insp-bg);color:var(--insp-t)}
+.undo-box.fix{background:var(--fix-bg);color:var(--fix-t)}
+.undo-box .grow{flex:1;min-width:180px;overflow-wrap:anywhere}
+.pc .li:has(> .avail){flex-wrap:wrap;row-gap:4px}
+.avail{flex-basis:100%;display:flex;align-items:center;justify-content:flex-end;gap:6px;font-size:12px;color:var(--mute);cursor:default}
+.avail span{white-space:nowrap}
+.avail input{width:auto;padding:3px 6px;font-size:13px;border-radius:7px}
+/* 整備工場の希望日（取りに行きたい日）と「この日でOK」 */
+.avail{flex-wrap:wrap;row-gap:4px}
+.avail label{display:flex;align-items:center;gap:6px;margin:0;cursor:default}
+.avail .hope{font-weight:700;font-size:12px;padding:3px 8px;border-radius:7px;background:var(--use-bg);color:var(--use-deep);white-space:nowrap}
+.avail .hope.ok{background:var(--free-bg);color:var(--free-t)}
+.ntable td.nna{color:var(--mute)}
+
+/* =====================================================================
+   空き表（aki-chart.html の試作どおり）・予約のカレンダー（yoyaku-range.html の試作どおり）
+   ===================================================================== */
+:root{
+  --a-today:#FFF4E2; --a-wkend:#F6F7F4; --a-sat:#3E6FB0; --a-sun:#C8443A; --a-line2:#C9CEC6; --a-chip:#F2F4F0;
+  --range:#DDF1E4; --busy-fg:#A3A9A2;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --a-today:#3A3226; --a-wkend:#1E2329; --a-sat:#7FA3D8; --a-sun:#E0786F; --a-line2:#424A53; --a-chip:#2B323A;
+    --range:#1F3A2A; --busy-fg:#5F6870;
+  }
+}
+:root[data-theme="dark"]{
+  --a-today:#3A3226; --a-wkend:#1E2329; --a-sat:#7FA3D8; --a-sun:#E0786F; --a-line2:#424A53; --a-chip:#2B323A;
+  --range:#1F3A2A; --busy-fg:#5F6870;
+}
+
+/* ---- PC：いちばん上のタブ（今日の状況・空き表） ---- */
+.pctabs{display:flex;gap:4px;border-bottom:1.5px solid var(--line);margin:4px 0 6px}
+.pctabs button{background:none;border:0;border-bottom:3px solid transparent;margin-bottom:-1.5px;padding:10px 20px;font-weight:900;font-size:16px;color:var(--mute)}
+.pctabs button.on{color:var(--steel-t);border-bottom-color:var(--steel-t)}
+
+/* ---- 空き表：全体（スマホは表の中だけスクロール。PC は画面の高さに合わせる） ---- */
+.aki{display:flex;flex-direction:column;gap:10px;min-height:0}
+#ph-screen.aki-mode{display:flex;flex-direction:column;overflow:hidden;padding-top:10px}
+#ph-screen .aki{flex:1;gap:8px}
+#ph-screen .a-board{flex:1;min-height:0}
+#ph-screen .aki-scroll{height:100%} /* （2つの枠にしたスマホは下の .a-split で上書き） */
+.aki.is-pc .aki-scroll{max-height:calc(100vh - 250px);max-height:calc(100dvh - 250px);min-height:320px} /* 高さは JS（fitAki）で画面の下まで */
+/* PC の空き表：左右の余白をなくして画面の幅いっぱい。1日の幅は28日分がちょうど入るように（最低46px） */
+.pc.pc-aki{max-width:none;padding:0;margin-bottom:0}
+/* 点検表：画面の幅いっぱい（両はしは少しあける） */
+.pc.pc-check{max-width:none;padding:0 12px}
+.pc.pc-aki .aki-head{padding:0 16px}
+.aki.is-pc{gap:8px}
+.aki.is-pc > :not(.a-board){margin-inline:16px}
+.aki.is-pc .a-board{border-radius:0;border-left:0;border-right:0}
+.aki.is-pc .a-grid{--namew:196px;--rowh:58px} /* --dayw は JS（fitAki）で、表の中の幅から計算して入れる */
+.aki.is-pc .a-hd b{font-size:16px}
+.aki.is-pc .aplate{min-width:100px;padding:2px 8px 3px}
+.aki.is-pc .aplate .t{font-size:11px}
+.aki.is-pc .aplate .h{font-size:12px}
+.aki.is-pc .aplate .n{font-size:19px}
+.aki.is-pc .a-thumb .thumb{width:48px;height:36px}
+.aki.is-pc .a-thumb .thumb svg{width:40px}
+.aki.is-pc .a-blk{height:44px;font-size:14px;container-type:inline-size}
+.aki.is-pc .a-blk small{font-size:12.5px}
+/* 帯がせまくて名前と現場の両方が入らないときは、名前だけ（両方が「渡…」「西…」と切れないように） */
+@container (max-width: 84px){ .aki.is-pc .a-blk small{display:none} }
+/* PC の空き表：表より上は2段だけ。1段目＝タブ＋小さな切り替え、2段目＝種類のタブ・期間・色の説明 */
+.a-top{display:flex;align-items:flex-end;gap:12px;border-bottom:1.5px solid var(--line);margin-top:4px}
+.a-top .pctabs{border-bottom:0;margin:0}
+.sw-mini{margin-left:auto;align-self:center;display:flex;gap:4px;padding:4px 0}
+.sw-mini button{border:1.5px solid var(--line-strong);background:var(--paper);border-radius:999px;padding:3px 12px;font-size:12px;font-weight:700;min-height:30px;color:var(--ink)}
+.sw-mini button.on{background:var(--steel);border-color:var(--steel);color:#fff}
+.a-bar{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px}
+.a-ptabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;width:min(520px,100%)}
+.a-ptabs button{min-height:36px;padding:0 8px;border:1.5px solid var(--line-strong);border-radius:10px;background:var(--paper);color:var(--ink);font-size:15px;font-weight:700;white-space:nowrap}
+.a-ptabs button .n{margin-left:6px;font-size:12px;font-weight:500;opacity:.75}
+.a-ptabs button.on{background:var(--steel-t);border-color:var(--steel-t);color:var(--steel-t-ink)}
+.a-span{font-size:14px;font-weight:700;color:var(--mute);white-space:nowrap}
+.aki.is-pc .a-legend{margin-left:auto;align-items:center}
+/* 種類の絞り込み：今のアプリのタブと同じ角丸の四角。台数は下に */
+.chips.aki-types{margin-bottom:0;max-width:560px}
+.aki-types .chip{flex-direction:column;flex-wrap:nowrap;row-gap:1px;min-height:52px}
+.aki-types .chip .n{font-size:12px}
+#ph-screen .aki-types .chip{min-height:48px}
+.a-legend{display:flex;flex-wrap:wrap;gap:6px 12px;font-size:13px;color:var(--mute)}
+#ph-screen .a-legend{gap:4px 9px;font-size:12px}
+.a-legend span{display:inline-flex;align-items:center;gap:5px}
+.a-legend i{width:14px;height:10px;border-radius:3px;display:inline-block}
+.a-legend i.use{background:var(--use)} .a-legend i.fix{background:var(--fix)} .a-legend i.insp{background:var(--insp)}
+.a-legend i.late{background:var(--use);box-shadow:inset 0 0 0 2px var(--fix)}
+.a-legend i.free{background:var(--paper);border:1px solid var(--a-line2)}
+.a-rot{margin:0;font-size:12px;color:var(--mute)}
+
+/* ---- 空き表：表 ---- */
+.a-board{background:var(--paper);border:1.5px solid var(--line);border-radius:12px;overflow:hidden}
+.aki-scroll{overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+.a-grid{--namew:172px;--dayw:46px;--rowh:50px;display:grid;grid-template-columns:var(--namew) repeat(var(--days),var(--dayw));min-width:max-content;font-size:15px;line-height:1.2}
+#ph-screen .a-grid,#ph-screen .a-split{--namew:132px;--dayw:42px}
+/* 止まったままにする部分：上の日付・空き台数の行、左の車の列・まとまりの見出し */
+.a-corner,.a-hd,.a-cnth,.a-cnt{position:sticky;background:var(--paper);z-index:6}
+.a-corner,.a-hd{top:0} .a-cnth,.a-cnt{top:44px}
+.a-corner,.a-cnth{left:0;z-index:8;border-right:1px solid var(--a-line2)}
+.a-corner{height:44px;display:flex;align-items:flex-end;padding:0 8px 6px;font-size:12px;color:var(--mute);border-bottom:1px solid var(--a-line2)}
+.a-hd{height:44px;text-align:center;padding-top:5px;font-size:12px;border-bottom:1px solid var(--a-line2);font-variant-numeric:tabular-nums}
+.a-hd b{display:block;font-size:15px}
+.a-hd.sat{color:var(--a-sat)} .a-hd.sun{color:var(--a-sun)}
+.a-hd.today,.a-cnt.today{background:var(--a-today)}
+.a-cnth{height:30px;display:flex;align-items:center;padding:0 8px;color:var(--free-t);font-weight:700;font-size:13px;border-bottom:2px solid var(--a-line2)}
+.a-cnt{height:30px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;border-bottom:2px solid var(--a-line2);color:var(--free-t);font-variant-numeric:tabular-nums}
+.a-cnt.low{color:var(--fix-t)}
+.a-name{position:sticky;left:0;z-index:5;background:var(--paper);border-right:1px solid var(--a-line2);border-bottom:1px solid var(--line);padding:5px 8px;display:flex;align-items:center;gap:7px;height:var(--rowh);cursor:pointer}
+.a-name:focus-visible{outline:3px solid var(--use);outline-offset:-3px}
+.a-thumb{flex:none;display:flex}
+.a-thumb .thumb{width:40px;height:30px;border-radius:5px}
+.a-thumb .thumb svg{width:34px}
+.aplate{background:#fff;color:#1E6B3A;border:1.5px solid #1E6B3A;border-radius:5px;padding:1px 6px 2px;line-height:1.05;display:inline-flex;flex-direction:column;align-items:center;min-width:86px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.aplate .t{font-size:9.5px;font-weight:700;letter-spacing:.06em}
+.aplate .b{display:flex;align-items:baseline;gap:3px}
+.aplate .h{font-size:10px;font-weight:700}
+.aplate .n{font-size:16px;font-weight:900;letter-spacing:.02em}
+.a-gname{position:sticky;left:0;z-index:5;background:var(--a-chip);font-size:13px;font-weight:700;color:var(--mute);padding:4px 10px;border-bottom:1px solid var(--line);border-right:1px solid var(--a-line2)}
+.a-gtrack{grid-column:2 / -1;background:var(--a-chip);border-bottom:1px solid var(--line)}
+/* 1台の行：日の区切り線と土日・今日の色は背景で描く（--daybg は JS で作る） */
+.a-track{grid-column:2 / -1;display:grid;grid-template-columns:repeat(var(--days),var(--dayw));border-bottom:1px solid var(--line);height:var(--rowh);cursor:pointer;
+  background:repeating-linear-gradient(90deg,transparent 0 calc(var(--dayw) - 1px),var(--line) calc(var(--dayw) - 1px) var(--dayw)),var(--daybg)}
+.a-blk:focus-visible{outline:3px solid var(--use);outline-offset:-2px}
+/* 帯：予約・使用中＝オレンジ、修理中＝赤、車検中＝紫、返却遅れ＝赤いふち＋しま模様。横にずらしても名前は左はしに残る */
+.a-blk{grid-row:1;align-self:center;margin:0 2px;height:36px;border-radius:7px;color:#fff;font-size:12px;font-weight:700;line-height:1.2;padding:2px 7px;text-align:left;overflow:hidden;overflow:clip;white-space:nowrap;border:0;cursor:pointer;z-index:2;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;min-width:0}
+/* ↑ overflow:clip にする（hidden だと帯そのものが基準になり、名前が左はしに残らない） */
+.a-blk span,.a-blk small{overflow:hidden;text-overflow:ellipsis;position:sticky;left:calc(var(--namew) + 6px);max-width:100%}
+.a-blk small{font-weight:500;opacity:.92;font-size:12px}
+.a-blk.use{background:var(--use)} .a-blk.fix{background:var(--fix)} .a-blk.insp{background:var(--insp)}
+.a-blk.late{box-shadow:inset 0 0 0 3px var(--fix);background:repeating-linear-gradient(135deg,var(--use) 0 8px,color-mix(in srgb,var(--use) 82%,var(--fix)) 8px 16px)}
+.a-blk .lt{font-size:10.5px;font-weight:900;background:var(--fix);color:#fff;border-radius:4px;padding:0 4px;margin-right:4px;display:inline-block;font-style:normal}
+.a-blk.cont-l{border-top-left-radius:0;border-bottom-left-radius:0;margin-left:0}
+.a-blk.cont-r{border-top-right-radius:0;border-bottom-right-radius:0;margin-right:0}
+
+/* ---- 空き表：スマホ横向き（見出しや色の説明を隠して、表を大きく） ---- */
+@media (orientation:landscape){ .a-rot{display:none} }
+@media (orientation:landscape) and (max-height:500px){
+  .phone.aki-on header{min-height:0;padding-top:calc(5px + env(safe-area-inset-top,0px));padding-bottom:5px}
+  .phone.aki-on header h1{font-size:16px}
+  .phone.aki-on .tabs button{min-height:40px;flex-direction:row;gap:6px;padding:4px 0}
+  .phone.aki-on .tabs button .ic{font-size:18px}
+  #ph-screen.aki-mode{padding-top:6px;padding-bottom:calc(52px + max(0px,calc(var(--sab) - 10px)))}
+  #ph-screen .aki{gap:6px}
+  #ph-screen .a-legend{display:none}
+  #ph-screen .aki-types .chip{min-height:36px;flex-direction:row;column-gap:6px;font-size:14px}
+  #ph-screen .a-grid,#ph-screen .a-split{--rowh:40px}
+  #ph-screen .a-blk{height:30px}
+}
+
+/* ---- 空き表：押したときに下から出る小さな画面 ---- */
+.aveil{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:55;display:flex;align-items:flex-end;justify-content:center}
+.asheet{background:var(--paper);color:var(--ink);width:100%;max-width:480px;border-radius:16px 16px 0 0;padding:18px 16px calc(18px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:12px;max-height:90vh;overflow:auto}
+@media (min-width:700px) and (min-height:501px){.aveil{align-items:center}.asheet{border-radius:16px}}
+.asheet h3{margin:0;font-size:18px}
+.asheet p{margin:0;line-height:1.6;overflow-wrap:anywhere}
+.asheet .vtags{margin:0}
+.a-who{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.a-who .thumb{width:64px;height:46px;border-radius:8px}
+.a-who .thumb svg{width:54px}
+.a-who .m{font-size:14px;color:var(--mute)}
+.a-late{color:var(--fix-t);font-weight:700}
+.abtn{border:0;border-radius:10px;min-height:48px;font-size:16px;font-weight:700;width:100%}
+.abtn.go{background:var(--free);color:#fff}
+.abtn.go.steel{background:var(--steel);color:#fff}
+.abtn.ghost{background:transparent;color:var(--ink);border:1.5px solid var(--line-strong)}
+
+/* ---- 予約：借りる日 → 返す日 の2回押して期間を選ぶカレンダー ---- */
+.rc{display:flex;flex-direction:column;gap:10px}
+.rc-pick{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px;background:var(--paper);border:1.5px solid var(--line);border-radius:12px;padding:10px 12px}
+.rc-box{display:flex;flex-direction:column;gap:2px;padding:6px 8px;border-radius:8px;border:2px solid transparent;min-width:0}
+.rc-box.on{border-color:var(--free)}
+.rc-box .lb{font-size:12px;color:var(--mute);font-weight:700}
+.rc-box .v{font-size:18px;font-weight:900;font-variant-numeric:tabular-nums;white-space:nowrap}
+.rc-box .v.empty{color:var(--busy-fg);font-weight:500;font-size:16px}
+.rc-arrow{color:var(--mute)}
+.rc-sum{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.rc-days{margin:0;font-weight:700;color:var(--free-t);min-width:0}
+.rc-days small{display:block;font-size:13px;font-weight:500;color:var(--mute)}
+.rc-clr{flex:none;min-height:40px;padding:0 14px;border:1.5px solid var(--line-strong);border-radius:10px;background:var(--paper);font-size:14px;font-weight:700}
+.rc-clr:disabled{opacity:.4;cursor:default}
+.rc-msg{margin:0;font-size:14px;font-weight:700;color:var(--fix-t);overflow-wrap:anywhere}
+.rc-cal{background:var(--paper);border:1.5px solid var(--line);border-radius:12px;padding:12px 8px}
+.rc-cal h3{font-size:16px;margin:0 0 8px 6px}
+.rc-wk,.rc-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}
+.rc-wk div{text-align:center;font-size:12px;color:var(--mute);padding-bottom:4px}
+.rc-wk .sun{color:var(--a-sun)} .rc-wk .sat{color:var(--a-sat)}
+.rc-d{position:relative;height:46px;display:flex;align-items:center;justify-content:center;min-width:0}
+.rc-d button{appearance:none;border:0;background:transparent;width:42px;height:42px;max-width:100%;border-radius:50%;padding:0;font-size:16px;font-weight:700;color:var(--ink);position:relative;z-index:1;font-variant-numeric:tabular-nums}
+.rc-d button:focus-visible{outline:3px solid var(--use);outline-offset:1px}
+.rc-d.sun button{color:var(--a-sun)} .rc-d.sat button{color:var(--a-sat)}
+.rc-d.past button{color:var(--busy-fg);cursor:default}
+.rc-d.busy button{color:var(--busy-fg);text-decoration:line-through;cursor:not-allowed}
+.rc-d.busy::after{content:attr(data-why);position:absolute;bottom:0;font-size:9px;line-height:1;color:var(--busy-fg)}
+.rc-d.today button{box-shadow:inset 0 0 0 2px var(--use)}
+.rc-d.in::before{content:"";position:absolute;inset:4px 0;background:var(--range)}
+.rc-d.start::before{left:50%} .rc-d.end::before{right:50%}
+.rc-d.start.end::before{display:none}
+.rc-d.start button,.rc-d.end button{background:var(--free);color:#fff}
+.rc-legend{display:flex;gap:6px 14px;font-size:12px;color:var(--mute);flex-wrap:wrap}
+.rc-legend i{display:inline-block;width:12px;height:12px;border-radius:50%;vertical-align:-1px;margin-right:4px}
+.rc-on{background:var(--free)} .rc-today{box-shadow:inset 0 0 0 2px var(--use)}
+.rc-legend s{color:var(--busy-fg)}
+/* 続けて／飛び飛び の切り替え（2つに分かれたボタン） */
+.rc-mode{display:grid;grid-template-columns:1fr 1fr;border:1.5px solid var(--steel-t);border-radius:12px;overflow:hidden}
+.rc-mode button{min-height:48px;border:0;background:var(--paper);color:var(--steel-t);font-size:16px;font-weight:900;padding:0 8px}
+.rc-mode button+button{border-left:1.5px solid var(--steel-t)}
+.rc-mode button.on{background:var(--steel-t);color:var(--steel-t-ink)}
+/* 飛び飛び：選んだ日を並べる。カレンダーは1日ずつ緑の丸 */
+.rc-pick.multi{display:flex;flex-direction:column;gap:2px;padding:12px 14px}
+.rc-pick.multi .lb{font-size:12px;color:var(--mute);font-weight:700}
+.rc-pick.multi .v{font-size:16px;font-weight:900;line-height:1.5;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.rc-pick.multi .v b{margin-left:.8em;color:var(--free-t);white-space:nowrap}
+.rc-pick.multi .v.empty{color:var(--busy-fg);font-weight:500}
+.rc-days.sub2{color:var(--mute);font-weight:500;font-size:14px}
+.rc-d.pick button{background:var(--free);color:#fff}
+/* ---- スマホの空き表：縦に動く外の枠と、横に動く中の枠に分ける（ブラウザ本来のスクロールのまま、斜めにふらつきにくく） ----
+   外の枠（.a-v）＝縦だけ。中に左の車の列（.a-names）と横に動く中の枠（.a-h）
+   上の日付・空き台数の行（.a-hhead）は外の枠の外に置いて縦には動かさず、横は中の枠に合わせて JS でそろえる */
+.a-split{--rowh:50px;display:flex;flex-direction:column}
+.a-split .a-corner,.a-split .a-cnth,.a-split .a-hd,.a-split .a-cnt,.a-split .a-name,.a-split .a-gname{position:static}
+.a-headrow{flex:none;display:flex;background:var(--paper)}
+.a-headl{flex:none;width:var(--namew);display:flex;flex-direction:column}
+.a-hhead{flex:1;min-width:0;overflow:hidden}
+.a-hgrid{display:grid;grid-template-columns:repeat(var(--days),var(--dayw));width:max-content}
+#ph-screen .a-split .aki-scroll{height:auto;flex:1;min-height:0}
+.a-split .a-v{overflow-x:hidden;overflow-y:auto}
+.a-vin{display:flex;align-items:flex-start}
+.a-names{flex:none;width:var(--namew)}
+.a-h{flex:1;min-width:0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
+.a-rows{width:calc(var(--dayw) * var(--days))}
+.a-split .a-gname,.a-split .a-gtrack{height:25px}
+.a-split .a-gname{display:flex;align-items:center}
+.a-split .a-blk span{left:6px} /* 帯の名前は、中の枠の左はしに残す */
+/* 下のタブは、スクロールしたカレンダーの日（z-index:1）より上に出す */
+.tabs{z-index:10}
+/* PC：予約の小さな画面 */
+.rmodal.modal{width:min(520px,100%)}
+
+/* =====================================================================
+   点検（日常・1ヶ月点検）。設定で「点検表をつかう」をオンにしたときだけ出る
+   ===================================================================== */
+/* ---- スマホ：使用中の車の帯の「乗る前の点検をお願いします」 ---- */
+.mu-check{margin-top:8px;padding-top:8px;border-top:1.5px dashed color-mix(in srgb,var(--use) 55%,transparent);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.mu-check > span{flex:1;min-width:10em;font-weight:900;font-size:15px;color:var(--use-deep)}
+.mu-cbtns{display:flex;gap:6px;flex:none}
+.mu-cbtn{min-height:44px;padding:0 16px;border:0;border-radius:12px;background:var(--free);color:#fff;font-size:15px;font-weight:900}
+.mu-cskip{min-height:44px;padding:0 10px;border:1.5px solid var(--line-strong);border-radius:12px;background:var(--paper);color:var(--mute);font-size:13px;font-weight:700}
+/* 予約したあとの画面（今日から使う車） */
+.ck-ask{display:flex;flex-direction:column;align-items:center;gap:6px;background:var(--use-bg);border:2px solid var(--use);border-radius:14px;padding:14px;margin:0 0 14px}
+.ck-ask b{color:var(--use-deep);font-size:17px}
+.ck-ask span{color:var(--mute);font-size:14px;overflow-wrap:anywhere}
+.ck-ask .btn{margin-top:4px}
+/* ---- スマホ：点検の画面（分類ごとのまとまり。1こずつ大きい「OK」「問題あり」） ---- */
+.nsw-row span small{display:block;font-size:12px;font-weight:500;color:var(--mute);margin-top:2px}
+.ck-info{margin:-6px 0 12px;padding:10px 12px;background:var(--bg);border-radius:10px;font-size:14px;line-height:1.6;color:var(--mute)}
+.ck-mon{margin:-4px 0 10px;border-top:1.5px solid var(--line)}
+.ck-prog{display:flex;flex-direction:column;gap:6px;margin:0 0 12px}
+.ck-pt{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:14px;color:var(--mute)}
+.ck-pt b{font-size:17px;color:var(--ink);font-variant-numeric:tabular-nums}
+.ck-bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden}
+.ck-bar i{display:block;height:100%;background:var(--steel-t);border-radius:inherit;transition:width .2s}
+.ck-grp{background:var(--paper);border:1.5px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:12px}
+.ck-gh{padding:11px 14px 8px;display:flex;flex-direction:column}
+.ck-gh b{font-size:16px;font-weight:900}
+.ck-gh span{font-size:12px;color:var(--mute)}
+.ck-row{display:flex;align-items:center;gap:8px;padding:9px 10px 9px 14px;border-top:1px solid var(--line)}
+.ck-row.ng{background:var(--fix-bg)}
+.ck-lab{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px;font-size:16px;line-height:1.4;overflow-wrap:anywhere}
+.ck-airtag{padding:1px 8px;border-radius:999px;background:var(--bg);border:1px solid var(--line);font-size:12px;color:var(--mute)}
+.ck-okb,.ck-ngb{flex:none;height:48px;border-radius:10px;font-weight:900;background:var(--paper)}
+.ck-okb{width:60px;border:2px solid var(--steel-t);color:var(--steel-t);font-size:17px}
+.ck-ngb{width:84px;border:2px solid var(--fix-t);color:var(--fix-t);font-size:14px}
+.ck-okb[aria-pressed="true"]{background:var(--steel-t);border-color:var(--steel-t);color:var(--steel-t-ink)}
+.ck-ngb[aria-pressed="true"]{background:var(--fix);border-color:var(--fix);color:#fff}
+.ck-ngnote{padding:2px 14px 12px;background:var(--fix-bg);display:flex;flex-direction:column;gap:6px}
+.ck-ngnote label{font-size:14px;font-weight:700;color:var(--fix-t)}
+.ck-ngnote textarea{resize:none;font-size:16px;padding:10px 12px}
+.ck-mbody{padding:0 14px 8px;border-top:1px solid var(--line)}
+.ck-mbody label{display:block;font-size:14px;color:var(--mute);margin:10px 0 6px}
+.ck-mbody .days-in input{width:180px;font-size:22px;font-weight:900}
+.ck-km .row{padding:10px 2px}
+.ck-km .row:last-child{border-bottom:0}
+.ck-km .hint{margin:0 0 8px}
+
+/* ---- PC：今日の状況の「点検」 ---- */
+.ckpanel h2{gap:10px;flex-wrap:wrap}
+.ckpanel h2 .tag{margin-left:6px}
+.ck-who{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--mute);margin:0}
+.ck-who select{width:auto;padding:5px 10px;font-size:14px;border-radius:8px}
+.pc .ckpanel .li{align-items:flex-start;flex-wrap:wrap}
+.pc .ckpanel .li .t{white-space:normal}
+.pc .ckpanel .rbtns{margin-left:auto;flex-direction:row}
+.pc .ckpanel .li > .btn{margin-left:auto;align-self:center}
+.ck-ngs{display:flex;flex-direction:column;gap:2px;margin-top:4px}
+.ck-ngs span{color:var(--fix-t);font-weight:700;font-size:14px;overflow-wrap:anywhere}
+.ck-okhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 18px;border-top:1.5px solid var(--line);background:var(--bg);font-size:14px}
+.ck-okhead b{font-size:16px}
+
+/* ---- PC：設定 → 点検 ---- */
+.ck-items{max-height:360px;overflow:auto;border:1.5px solid var(--line);border-radius:12px;margin-top:10px}
+.ck-itbl{width:100%;border-collapse:collapse;font-size:14px}
+.ck-itbl th{position:sticky;top:0;z-index:1;background:var(--paper);text-align:left;padding:8px;border-bottom:1.5px solid var(--line);font-size:13px;color:var(--mute);white-space:nowrap}
+.ck-itbl td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+.ck-itbl td.c{color:var(--mute);font-size:13px;white-space:nowrap}
+.ck-itbl select{width:auto;padding:4px 8px;font-size:14px;border-radius:8px}
+.ck-itbl .a label,.ck-add .a{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500;white-space:nowrap;margin:0}
+.ck-itbl input[type=checkbox],.ck-add input[type=checkbox]{width:20px;height:20px;padding:0;flex:none;accent-color:var(--steel)}
+.ck-add{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.6fr) auto auto auto;gap:8px;margin-top:10px;align-items:center}
+.ck-add select{width:auto}
+@media (max-width:760px){.ck-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
+
+/* 設定 → 点検：いちばん上の ON/OFF、車の一覧（エアタンク あり／なし・点検の数） */
+.ck-onrow{border-bottom:1.5px solid var(--line);font-size:18px}
+.ck-sec{margin-top:18px}
+.ck-sh{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 14px;margin-bottom:8px}
+.ck-sh b{font-size:16px;font-weight:900}
+.ck-sh span{font-size:13px;color:var(--mute)}
+.ck-cars{overflow-x:auto;border:1.5px solid var(--line);border-radius:12px}
+.ck-ctbl{width:100%;border-collapse:collapse;font-size:15px}
+.ck-ctbl th{background:var(--bg);text-align:left;padding:8px 12px;font-size:13px;color:var(--mute);font-weight:700;white-space:nowrap;border-bottom:1.5px solid var(--line)}
+.ck-ctbl td{padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
+.ck-ctbl tr:last-child td{border-bottom:0}
+.ck-ctbl td.n{color:var(--mute);font-size:14px;font-variant-numeric:tabular-nums}
+.ck-ctbl .m{color:var(--mute)}
+.ck-no{display:inline-block;background:var(--plate);color:var(--plate-ink);border:2px solid #39424D;border-radius:6px;padding:0 8px;font-weight:900;font-size:15px;letter-spacing:.06em;font-variant-numeric:tabular-nums}
+.ck-air{display:inline-flex;border:1.5px solid var(--line-strong);border-radius:10px;overflow:hidden}
+.ck-air button{min-width:72px;min-height:44px;border:0;background:var(--paper);color:var(--ink);font-size:16px;font-weight:700}
+.ck-air button+button{border-left:1.5px solid var(--line-strong)}
+.ck-air button[aria-pressed="true"]{background:var(--steel);color:#fff}
+
+/* ---- PC：点検表（紙の「日常・1ヶ月点検リスト」と同じ形。A4横） ---- */
+.ck-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0}
+.ck-tools select{width:auto;max-width:360px;padding:8px 12px;font-size:15px}
+.ck-tools .sp{flex:1}
+.ck-mnav{display:flex;align-items:center;gap:10px}
+.ck-mnav b{font-size:17px;min-width:7.5em;text-align:center}
+
+.ck-sheet{width:283mm;margin:0 auto;background:#fff;color:#111;font-size:8pt;line-height:1.25;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.ck-sheet table{border-collapse:collapse}
+.ck-sheet th,.ck-sheet td{border:.3mm solid #333;padding:0 .6mm;font-weight:500}
+.ck-top{display:flex;align-items:flex-start;gap:3mm;margin-bottom:2.5mm}
+.ck-title{border:.3mm solid #333;padding:3mm 4mm;font-size:10pt;font-weight:700;min-width:42mm;text-align:center}
+.ck-hd th{background:#f0f0f0;text-align:left;padding:.6mm 1.5mm;white-space:nowrap;font-weight:700}
+.ck-hd td{min-width:9mm;height:5mm;text-align:center;padding:.6mm 1.5mm}
+.ck-hd td.num{min-width:20mm;text-align:right;font-size:9.5pt;font-weight:700}
+.ck-hd td.u{min-width:0;padding-left:.5mm}
+.ck-hd .hl{background:#fff36a}
+.ck-car{flex:1;min-width:0;font-size:8pt;color:#333;padding-top:1mm;overflow-wrap:anywhere}
+.ck-seal th{background:#f0f0f0;width:14mm;font-size:7pt;padding:.5mm;text-align:center}
+.ck-seal td{height:13mm;text-align:center;vertical-align:middle}
+.ck-tbl{width:100%;table-layout:fixed}
+.ck-tbl th{background:#f0f0f0;font-weight:700;height:4.6mm;text-align:center;font-size:7.5pt;padding:0}
+.ck-tbl th.ck-catc{width:27mm} .ck-tbl th.ck-item{width:77mm} .ck-tbl th.ck-end{width:8mm}
+.ck-tbl th.red{color:#d00}
+.ck-tbl td{height:4.3mm}
+.ck-tbl td.ck-catc{text-align:center;font-size:7pt;white-space:nowrap;overflow:hidden}
+.ck-tbl td.ck-item{font-size:6.8pt;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ck-tbl td.ck-c{text-align:center;padding:0}
+.ck-v{font-size:8.5pt;font-weight:700}
+.ck-x{font-size:8.5pt;font-weight:900;color:#d00}
+.ck-mrun{background:#ececec}
+.ck-na{background:repeating-linear-gradient(135deg,#e2e2e2 0 1.2mm,#f3f3f3 1.2mm 2.4mm)}
+.ck-tbl .ck-end{border-left:.6mm solid #333}
+.ck-note{margin:1mm 0 2mm;font-size:7pt}
+.ck-bottom{display:flex;gap:3mm;align-items:flex-start}
+.ck-notes{width:40%;table-layout:fixed}
+.ck-notes th{background:#f0f0f0;font-size:7.5pt;height:4.6mm;text-align:center}
+.ck-notes td{height:6mm;font-size:7pt;border-top:0;border-bottom:.25mm dotted #555;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.ck-stamps{flex:1;table-layout:fixed}
+.ck-stamps th{background:#f0f0f0;font-size:7.5pt;height:4.6mm}
+.ck-stamps td{padding:0;text-align:center;vertical-align:top}
+.ck-stamps td.off{background:#e6e6e6}
+.ck-sheet .ck-blank{border:0}
+.ck-bd{border-bottom:.25mm solid #333;font-size:6.5pt;height:3.6mm;line-height:3.6mm;white-space:nowrap}
+.ck-bs{height:10.5mm;display:flex;align-items:center;justify-content:center}
+.ck-stamp{display:inline-flex;align-items:center;justify-content:center;width:8.5mm;height:8.5mm;border:.4mm solid #d22;border-radius:50%;color:#d22;font-size:7pt;font-weight:700;writing-mode:vertical-rl;line-height:1;letter-spacing:0;overflow:hidden}
+.ck-seal .ck-stamp{width:10mm;height:10mm;font-size:8pt}
+
+/* ---- 印刷の点検表：左上（題名と、前回のオイル・タイヤ交換）・車検の下の車の名前 ---- */
+.ck-tl{display:flex;flex-direction:column;gap:1.5mm}
+.ck-oil th{font-weight:500;font-size:7pt;background:#f7f7f7}
+.ck-oil td{height:4mm;min-width:8mm}
+
+/* ---- PC：点検表の画面（大きい字。上に車のボタン、見出しに車の情報と確認の欄） ---- */
+.ck-tools .ck-who{margin-left:6px}
+.ck-chips{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}
+.ck-chip{display:inline-flex;align-items:baseline;gap:6px;min-height:44px;padding:6px 16px;border:1.5px solid var(--line-strong);border-radius:999px;background:var(--paper);color:var(--ink);font-size:16px;font-weight:900;font-variant-numeric:tabular-nums}
+.ck-chip span{font-size:14px;font-weight:700;color:var(--mute)}
+.ck-chip[aria-pressed="true"]{background:var(--steel-t);border-color:var(--steel-t);color:var(--steel-t-ink)}
+.ck-chip[aria-pressed="true"] span{color:inherit;opacity:.85}
+.cks .m,.cks-facts .m{color:var(--mute);font-weight:500;font-size:14px}
+.cks-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 14px;padding:14px 18px;border-bottom:1.5px solid var(--line)}
+.cks-head h2{margin:0;font-size:18px;font-weight:900}
+.cks-top{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;justify-content:space-between;padding:16px 18px}
+.cks-facts{flex:999 1 560px;min-width:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px 22px}
+.cks-facts div{display:flex;flex-direction:column;gap:2px;min-width:0}
+.cks-facts span{font-size:13px;color:var(--mute)}
+.cks-facts b{font-size:19px;font-weight:900;overflow-wrap:anywhere}
+.cks-facts b small{display:block;font-size:13px;font-weight:700;color:var(--mute)}
+.cks-seals{flex:1 1 auto;display:flex;border:1.5px solid var(--line-strong);border-radius:10px;overflow:hidden}
+.cks-seals > div{width:100px;display:flex;flex-direction:column;border-right:1.5px solid var(--line-strong)}
+.cks-seals > div:last-child{border-right:0}
+.cks-seals .sl{padding:5px 0;text-align:center;font-size:13px;font-weight:700;background:var(--bg);border-bottom:1.5px solid var(--line-strong)}
+.cks-seals .sv{height:86px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;text-align:center;padding:4px}
+.cks-seals .sv .m{font-size:12px}
+.cks-seals .btn.small{padding:6px 10px;font-size:14px;min-height:40px}
+.cks-stamp{width:50px;height:50px;border-radius:50%;border:2px solid var(--fix);color:var(--fix-t);display:inline-flex;align-items:center;justify-content:center;font-size:14px;font-weight:900;writing-mode:vertical-rl;line-height:1;letter-spacing:.02em}
+.cks-undo{border:0;background:none;padding:0;border-radius:50%;cursor:pointer}
+.cks-undo:hover .cks-stamp{background:var(--fix-bg)}
+.cks-mini{width:22px;height:22px;border-radius:50%;border:1.5px solid var(--fix);color:var(--fix-t);font-size:11px;font-weight:900;display:inline-flex;align-items:center;justify-content:center}
+.cks-scroll{overflow-x:auto;border-top:1.5px solid var(--line-strong)}
+.cks-t{border-collapse:separate;border-spacing:0;font-size:14px;width:100%;table-layout:fixed;min-width:calc(120px + 300px + 46px + 31 * 28px)} /* 広い画面では幅いっぱい（日のマスは等分）。せまい画面では横にずらす */
+.cks-t th,.cks-t td{border-top:1px solid var(--line);border-right:1px solid var(--line);padding:0}
+.cks-t thead th{background:var(--bg);font-weight:700;height:34px;border-top:0}
+.cks-t .c1{width:120px;padding:6px 10px;font-weight:700;line-height:1.35;text-align:left;vertical-align:top}
+.cks-t .c2{width:300px;padding:6px 10px;line-height:1.4;text-align:left;border-right:1.5px solid var(--line-strong)}
+.cks-t .c2 small{color:var(--mute);font-size:12px}
+.cks-t .cd{height:34px;text-align:center;font-size:16px;font-weight:900;font-variant-numeric:tabular-nums}
+.cks-t thead .cd{font-size:13px}
+.cks-t .ce{width:46px;border-left:1.5px solid var(--line-strong);border-right:0}
+.cks-t tr.gtop > td{border-top-color:var(--line-strong)}
+.cks-t .red{background:color-mix(in srgb,var(--fix) 7%,var(--paper))}
+.cks-t thead .red{color:var(--fix-t);background:color-mix(in srgb,var(--fix) 12%,var(--bg))}
+.cks-t thead .td{background:var(--a-today)}
+.cks-t .okv{color:var(--steel-t)}
+.cks-t .ngv{color:var(--fix-t);background:var(--fix-bg)}
+.cks-t .mon{background:color-mix(in srgb,var(--mute) 13%,var(--paper))}
+.cks-t .na{background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--mute) 10%,var(--paper)) 0 6px,var(--paper) 6px 12px);text-align:center;font-size:12px;color:var(--mute);border-right:0}
+.cks-t tr.off .c2{color:var(--mute)}
+.cks-t tr.stp > td{border-top:2px solid var(--line-strong);height:42px}
+/* 横にずらしたときも「分類」「項目」の列は左に止めておく */
+.cks-t .c1,.cks-t .c2{position:sticky;z-index:2;background:var(--paper)}
+.cks-t .c1{left:0}
+.cks-t .c2{left:120px}
+.cks-t thead .c1,.cks-t thead .c2{background:var(--bg);z-index:3}
+.cks-legend{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:13px;color:var(--mute);padding:12px 18px;border-top:1.5px solid var(--line)}
+.cks-legend span{display:inline-flex;align-items:center;gap:6px}
+.cks-legend i{width:18px;height:16px;display:inline-block;border:1px solid var(--line)}
+.cks-legend i.mon{background:color-mix(in srgb,var(--mute) 13%,var(--paper))}
+.cks-legend i.na{background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--mute) 18%,var(--paper)) 0 4px,var(--paper) 4px 8px)}
+.cks-legend .okc{color:var(--steel-t)} .cks-legend .ngc{color:var(--fix-t)} .cks-legend .redc{color:var(--fix-t)}
+.cks-notes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+.cks-notes > div{padding:10px 18px;border-top:1px solid var(--line);font-size:15px;line-height:1.6;overflow-wrap:anywhere}
+.cks-notes > div:nth-child(odd){border-right:1px solid var(--line)}
+.cks-notes .nh{background:var(--bg);font-size:13px;font-weight:700;color:var(--mute);border-top:1.5px solid var(--line)}
+
+/* ---- PC：車の修正の「点検表に出すこと」 ---- */
+.ck-vset{border:1.5px solid var(--line);border-radius:12px;padding:6px 14px 12px;margin:0 0 14px}
+.ck-vset legend{padding:0 6px;font-weight:900;font-size:15px;color:var(--steel-t)}
+.ck-ym3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.ck-ym3 .field{margin-bottom:4px}
+.ck-ym3 label{font-size:13px}
+@media (max-width:600px){.ck-ym3{grid-template-columns:1fr}}
+
+/* 印刷：点検表だけを A4 横に1台1枚 */
+#ckprint{display:none}
+@media print{
+  @page{size:A4 landscape;margin:7mm}
+  body.ck-printing{padding:0!important;margin:0;background:#fff!important}
+  body.ck-printing > :not(#ckprint){display:none!important}
+  body.ck-printing #ckprint{display:block}
+  .ck-sheet-page{break-after:page;page-break-after:always}
+  .ck-sheet-page:last-child{break-after:auto;page-break-after:auto}
+}
+/* 設定の「現場リスト」「駐車場」：1行ずつ（名前の欄と ×）＋「新しく追加」 */
+.ilist{max-height:300px;overflow:auto;border:1.5px solid var(--line);border-radius:12px;padding:4px 12px}
+.ilist:empty{display:none}
+.irow{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--line)}
+.irow:last-child{border-bottom:0}
+.irow input{flex:1;min-width:0}
+.irow .x{background:none;border:0;font-size:22px;line-height:1;color:var(--mute);min-width:40px;min-height:40px;cursor:pointer}
+.iadd{display:flex;gap:8px;margin-top:8px}
+.iadd input{flex:1;min-width:0}
+.iadd[hidden]{display:none}

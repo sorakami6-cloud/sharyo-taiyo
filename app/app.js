@@ -1,0 +1,3110 @@
+// 社用車管理アプリ（段階1: 車両一覧・詳細・PC版の登録／修正／廃車・Firestore同期・サンプル投入）
+import { firebaseConfig, FIREBASE_SDK_VERSION, VAPID_KEY } from "../firebase-config.js";
+import { COMPANY } from "../company-config.js"; // 会社ごとにちがう値（会社の名前・整備工場の名前など）は、全部ここから
+
+const $ = id => document.getElementById(id);
+
+/* ---------- Firebase ---------- */
+const SDK = `https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}`;
+let fb;
+try {
+  const [app, auth, fs, st] = await Promise.all([
+    import(`${SDK}/firebase-app.js`),
+    import(`${SDK}/firebase-auth.js`),
+    import(`${SDK}/firebase-firestore.js`),
+    import(`${SDK}/firebase-storage.js`),
+  ]);
+  fb = { ...app, ...auth, ...fs, storageMod: st };
+} catch (e) {
+  console.error(e);
+  $("ph-screen").innerHTML = `<div class="errbar">読み込めませんでした。電波のよい所でもう一度開いてください。</div>`;
+  throw e;
+}
+const {
+  initializeApp, getAuth, signInAnonymously, onAuthStateChanged,
+  initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  collection, doc, query, where, onSnapshot, getDocs, setDoc, updateDoc, writeBatch,
+  serverTimestamp, Timestamp, runTransaction, getDocsFromServer, getDocFromServer, increment,
+  deleteDoc, arrayUnion, arrayRemove, deleteField,
+} = fb;
+const { getStorage, ref: storageRef, uploadBytesResumable, getDownloadURL, deleteObject } = fb.storageMod;
+
+const fbApp = initializeApp(firebaseConfig);
+const auth = getAuth(fbApp);
+// 電波が悪い現場でも前回の内容が見えるよう、端末にも保存しておく
+const db = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+const storage = getStorage(fbApp);
+
+/* ---------- 定数 ---------- */
+const APP_VERSION = "30"; // 版の番号（名前のメニューの下に出す）。app/sw.js・shop/sw.js の CACHE（taiyo-app-v○○・taiyo-shop-v○○）と同じ番号にする
+const TYPES = ["トラック", "バン", "普通車"];
+const SHOP_NAME = COMPANY.shopName || "整備工場"; // 整備工場の名前。専用ページは shop/
+// 見本か。見本では、サンプルの車も空き表・整備工場の画面に出す（会社用では出さない）
+const DEMO = !!COMPANY.demo;
+const LABEL = { free: "空き", use: "使用中", fix: "修理中", own: "専用", insp: "車検中" };
+// 設定がまだないときの最初の値（会社ごとの設定から）
+const DEFAULT_SETTINGS = {
+  sites: [...(COMPANY.sites || [])],
+  lots: (COMPANY.lots || []).length ? [...COMPANY.lots] : ["本社"],
+  shakenAlertDays: Number(COMPANY.shakenAlertDays) || 30,
+};
+const CAR_COLORS = ["#dfe4ea", "#f3f3f3", "#cfd6de", "#f7f7f7", "#c9d1d9", "#eef1f4", "#e5e9ee", "#f0f0f0"];
+
+/* ---------- データ（Firestore から届いたもの） ---------- */
+const S = {
+  vehicles: [], reservations: [], repairs: [],
+  settings: { ...DEFAULT_SETTINGS }, settingsExists: false,
+  members: [], membersLoaded: false, // 名簿（日報アプリと同じ形：name / kubun / shozoku / active）
+  notify: {}, notifyLoaded: false, // 通知を届ける人（PCで選ぶ）：{ shaken: [名前…], due: […], overdue: […], repair: […], wish: […], avail: […] }
+  prefs: new Map(), // 本人がスマホでオフにした通知：名前 → Set(種類)
+  tokenNames: new Set(), // 通知を許可した端末がある人の名前
+  tokens: [], tokenIds: new Set(), // 端末の登録（PCの通知タブに、人ごとの端末と登録した日を出す）
+  shopUsers: [], // 整備工場の人の名前（例：佐々木（さくら自動車））
+  checks: new Map(), checksLoaded: false, checkErr: "", // 点検の記録（先月の1日から＋まだ確認していないもの）。点検表がオンのときだけ読む
+  ready: false, error: "",
+};
+
+/* ---------- 画面の状態 ---------- */
+// 広い画面＝PC。スマホを横向きにしたとき（高さが低い）は、幅があってもスマホ版のまま
+const wide = matchMedia("(min-width: 900px) and (min-height: 501px)");
+const ui = { view: "phone", tab: "cars", screen: { name: "list" }, filter: "all", tfilter: "all", retiredOpen: false, backTo: null };
+const form = {}; // 予約フォームの入力中の内容（画面を描き直しても消えないように）
+const resetForm = () => { for (const k of Object.keys(form)) delete form[k]; };
+
+/* ---------- helpers ---------- */
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const pad = n => String(n).padStart(2, "0");
+const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const parse = s => { const [y, m, d] = String(s).split("-").map(Number); return new Date(y, m - 1, d); };
+const today = () => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); };
+const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+const fmt = s => { const d = parse(s); return `${d.getMonth() + 1}/${d.getDate()}`; };
+const jp = s => { const d = parse(s); return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`; };
+const DOW = "日月火水木金土";
+const daysTo = s => Math.round((parse(s) - today()) / 86400000);
+const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* 保存できなくても動く */ } };
+const millis = t => (t && t.toMillis ? t.toMillis() : Number.MAX_SAFE_INTEGER);
+
+/* ---------- 名簿（日報アプリと同じ区分・並び順） ---------- */
+const MGROUPS = ["自社", "常駐協力", "外注協力"];
+// 日報アプリと同じく、古い「協力」や空欄は「常駐協力」として扱う
+const mGroupOf = w => (!w || w.kubun === "自社") ? "自社" : (w.kubun === "外注協力" ? "外注協力" : "常駐協力");
+const isKana = x => /^[ァ-ヴー]+$/.test(x);
+const byLen = (a, b) => (isKana(a) - isKana(b)) || (a.length - b.length) || a.localeCompare(b, "ja");
+const activeMembers = () => S.members.filter(m => m.active !== false);
+// 区分ごとに分けた名前のボタン（日報アプリと同じ並び）。act は押したときの動き
+function nameChips(q, selected, act) {
+  // 名簿が届くまでは名前のボタンを出さない
+  if (!S.membersLoaded) return `<div class="loading">読み込み中…</div>`;
+  q = String(q || "").trim();
+  let html = "";
+  MGROUPS.forEach(g => {
+    const names = activeMembers().filter(m => mGroupOf(m) === g).map(m => m.name).filter(n => !q || n.includes(q)).sort(byLen);
+    if (!names.length) return;
+    html += `<div class="mgroup">${g}</div><div class="ngrid">${names.map(n =>
+      `<button class="nchip${selected === n ? " on" : ""}" data-act="${act}" data-val="${esc(n)}">${esc(n)}</button>`).join("")}</div>`;
+  });
+  if (html) return html;
+  return `<div class="empty">${q ? "該当する名前がありません" : "名簿がまだありません。事務所のPCで名簿を取り込んでください"}</div>`;
+}
+
+/* ---------- 自分の名前（このスマホに覚えておく） ---------- */
+let ME = lsGet("taiyo_me") || "";
+function saveMe(n) {
+  n = String(n || "").trim().slice(0, 40); if (!n) return;
+  ME = n; lsSet("taiyo_me", n); resetForm(); meQuery = "";
+  if (pushState() === "on") saveToken(); // この端末の通知を新しい名前にひもづけ直す
+  go({ name: "list" });
+}
+
+/* ---------- 車の状態（README「状態の決め方」） ---------- */
+const active = () => S.vehicles.filter(v => !v.retired);
+const byId = id => S.vehicles.find(v => v.id === id);
+function currentUse(v) {
+  const t = ymd(today());
+  // 返却予定を過ぎても返却していなければ使用中（返却待ち）。いちばん早く終わる予定のものを使う
+  return S.reservations.filter(r => r.vehicleId === v.id && !r.returnedAt && r.from <= t)
+    .sort((a, b) => (a.to > b.to ? 1 : a.to < b.to ? -1 : 0))[0] || null;
+}
+// 返却予定を過ぎて、まだ返却していない予約
+const isOverdue = r => !!r && !r.returnedAt && r.to < ymd(today());
+function fixRepair(v) { return S.repairs.find(r => r.vehicleId === v.id && r.status === "in_repair") || null; }
+function nextRes(v) {
+  const t = ymd(today());
+  return S.reservations.filter(r => r.vehicleId === v.id && !r.returnedAt && r.from > t).sort((a, b) => (a.from > b.from ? 1 : -1))[0] || null;
+}
+// 優先順：車検中 → 修理中 → 使用中 → 空き（廃車は一覧に出さない）
+function status(v) { return v.inspection ? "insp" : fixRepair(v) ? "fix" : (currentUse(v) ? "use" : "free"); }
+function repairText(r) { const s = (r.symptoms || []).join("・"); return s && r.memo ? `${s}：${r.memo}` : (s || r.memo || ""); }
+const lotOf = v => v.currentLot || v.homeLot || "";
+const alertDays = () => Number(S.settings.shakenAlertDays) || 30;
+
+/* ---------- 必要な免許・専用の車・一時的に隠す ---------- */
+const LICENSES = ["普通", "準中型5t", "準中型", "中型8t", "中型", "大型"];
+const LICENSE_NOTE = {
+  "普通": "普通免許で運転できます",
+  "準中型5t": "平成29年3月11日までに普通免許を取った人（平成19年6月2日〜平成29年3月11日に取った人は準中型5t限定、平成19年6月1日までに取った人は中型8t限定）、または準中型以上の免許の人",
+  "準中型": "平成19年6月1日までに普通免許を取った人（中型8t限定）、または準中型（限定なし）・中型以上の免許の人",
+  "中型8t": "平成19年6月1日までに普通免許を取った人（中型8t限定）、または中型（限定なし）・大型の免許の人",
+  "中型": "中型（限定なし）または大型の免許の人",
+  "大型": "大型免許の人",
+};
+const licOf = v => (LICENSES.includes(v.license) ? v.license : "普通");
+const shown = () => active().filter(v => !v.hidden); // 一時的に隠した車は一覧・車検・上のパネルに出さない
+// 専用の車は、専用の人と PC（広い画面）からだけ予約できる
+const canReserve = v => !v.owner || v.owner === ME || wide.matches;
+function vehicleTags(v) {
+  const l = licOf(v);
+  const t = (v.owner ? `<span class="vtag own">${esc(v.owner)}さん専用</span>` : "")
+    + (l !== "普通" ? `<span class="vtag lic" title="${esc(l)}：${esc(LICENSE_NOTE[l])}">${l}</span>` : "");
+  return t ? `<div class="vtags">${t}</div>` : "";
+}
+
+// 専用の車が使われていない（空き）
+const isOwnFree = v => !!v.owner && status(v) === "free";
+// PC の区分：使用中・空き・専用・修理中（専用の空きは「空き」に入れない）
+const groupOf = v => (isOwnFree(v) ? "own" : status(v));
+// スマホの「空き」に入れるか：専用の車は本人だけ
+const freeForMe = v => status(v) === "free" && !v.owner;
+// 絞り込み（スマホ・PC 共通）：専用は、専用の車すべて（使用中も含む）
+const matchFilter = (v, k) => k === "all" || (k === "free" ? freeForMe(v) : k === "own" ? !!v.owner : status(v) === k);
+// スマホの色帯・詳細の状態の見え方
+function statusView(v, st, use) {
+  if (st === "use" && isOverdue(use)) return { cls: "use over", label: "使用中（返却待ち）" };
+  if (isOwnFree(v)) return v.owner === ME ? { cls: "mine", label: "あなた専用" } : { cls: "own", label: `${v.owner}さん専用` };
+  return { cls: st, label: LABEL[st] };
+}
+
+// 車検中の期間の文字（例：10/1〜（戻り予定 10/4））
+const inspText = x => `${fmt(x.from)}〜${x.until ? `（戻り予定 ${fmt(x.until)}）` : ""}`;
+
+/* ---------- 部品（試作と同じ見た目） ---------- */
+function carColor(v) { let h = 0; for (const c of v.id) h = (h * 31 + c.charCodeAt(0)) >>> 0; return CAR_COLORS[h % CAR_COLORS.length]; }
+function carSvg(color) {
+  return `<svg viewBox="0 0 120 56" xmlns="http://www.w3.org/2000/svg"><path d="M14 40h92a4 4 0 0 0 4-4v-9c0-3-2-5-5-6l-14-3-12-11a6 6 0 0 0-4-2H38a6 6 0 0 0-5 3l-8 11-11 3c-3 1-5 3-5 6v8a4 4 0 0 0 4 4z" fill="${color}" stroke="#39424d" stroke-width="2.5" stroke-linejoin="round"/><path d="M42 12h28l9 10H35z" fill="#b8d8ee" stroke="#39424d" stroke-width="2"/><circle cx="34" cy="42" r="8" fill="#2a2f36"/><circle cx="34" cy="42" r="3.5" fill="#9aa4ae"/><circle cx="90" cy="42" r="8" fill="#2a2f36"/><circle cx="90" cy="42" r="3.5" fill="#9aa4ae"/></svg>`;
+}
+// big：大きい写真を使う（詳細）。zoom：押すと画面いっぱいに開く
+function thumbHtml(v, big, zoom) {
+  const small = v.thumbUrl || v.photoUrl;
+  if (!small) return `<div class="thumb" aria-hidden="true">${carSvg(carColor(v))}</div>`;
+  // 大きい写真：まず一覧用の小さい写真をすぐ出し、大きい写真が届いたら差し替える
+  // 小さい写真（一覧・表）：画面に入る少し手前から読み込む
+  const img = big
+    ? `<img src="${esc(small)}"${v.photoUrl && v.photoUrl !== small ? ` data-full="${esc(v.photoUrl)}"` : ""} alt="" decoding="async">`
+    : `<img data-src="${esc(small)}" alt="" decoding="async">`;
+  return zoom && v.photoUrl
+    ? `<div class="thumb has-photo zoomable" data-act="viewPhoto" data-val="${esc(v.photoUrl)}" role="button" tabindex="0" aria-label="写真を大きく見る">${img}</div>`
+    : `<div class="thumb has-photo" aria-hidden="true">${img}</div>`;
+}
+function plateHtml(v, small) {
+  return `<span class="plate"${small ? ' style="font-size:15px"' : ""}><small>${esc(v.plateArea)} ${esc(v.plateClass)}</small>${esc(v.plateKana)} ${esc(v.plateNum)}</span>`;
+}
+function shakenClass(v) { const d = daysTo(v.shakenDate); return d < 0 ? "over" : (d <= alertDays() ? "soon" : ""); }
+function shakenTag(v) {
+  const d = daysTo(v.shakenDate); if (d > alertDays() || v.inspection) return "";
+  return `<span class="shk ${d < 0 ? "over" : ""}"><span>🔔 車検</span><b>${d < 0 ? `${-d}日超過` : (d === 0 ? "今日" : `あと${d}日`)}</b></span>`;
+}
+// 車検の残り日数の札（車検に出している車は「車検中」）
+const shakenDays = (v, attr = "") => (v.inspection ? `<span class="days insp"${attr}>車検中</span>` : `<span class="days ${shakenClass(v)}"${attr}>${shakenText(v)}</span>`);
+const byShaken = list => [...list].sort((a, b) => (a.shakenDate > b.shakenDate ? 1 : -1));
+function shakenText(v) { const d = daysTo(v.shakenDate); return d < 0 ? `${-d}日 超過` : (d === 0 ? "今日" : `あと ${d}日`); }
+function bandExtra(v, st, use) {
+  if (st === "insp") return `<span class="period">${inspText(v.inspection)}</span>`;
+  if (use && isOverdue(use)) return `<span class="period">返却予定を過ぎています</span>`;
+  if (use) return `<span class="period">${fmt(use.from)}〜${fmt(use.to)}</span>`;
+  const next = nextRes(v);
+  if (st !== "fix" && next) return `<span class="period"><small>次の予約</small>${fmt(next.from)}〜</span>`;
+  return "";
+}
+// 整備工場が修理で預かっている：例「整備工場預かり 10/1〜（戻り予定 10/5）」
+const shopText = r => (r && r.shop ? `${esc(r.shop.shop || SHOP_NAME)}預かり ${fmt(r.shop.from)}〜${r.shop.until ? `（戻り予定 ${fmt(r.shop.until)}）` : ""}` : "");
+function useText(v, use, fix) {
+  if (v.inspection) return "車検に出しています";
+  if (!use && fix && fix.shop) return shopText(fix);
+  return use ? `${esc(use.who)}さん → ${esc(use.site)}` : (fix ? `修理待ち：${esc(repairText(fix))}` : `${esc(lotOf(v))} にあります`);
+}
+const errBar = () => (S.error ? `<div class="errbar">${esc(S.error)}</div>` : "");
+
+/* ---------- 画面の切り替え ---------- */
+function applyView() {
+  ui.view = wide.matches ? (lsGet("taiyo_view") || "pc") : "phone";
+  $("switch").hidden = !wide.matches;
+  $("phone").hidden = ui.view !== "phone";
+  $("pc").hidden = ui.view !== "pc";
+  $("swPhone").classList.toggle("on", ui.view === "phone");
+  $("swPc").classList.toggle("on", ui.view === "pc");
+  if (ui.view !== "pc") closeModal();
+  hideSheet();
+  render();
+}
+// 一覧から別の画面へ行くときはスクロール位置を覚えておき、詳細から「戻る」で一覧に戻ったら元の位置に戻す
+// （下のタブを押したときなどは一番上から）
+let listPos = null; // { tab, top, left, aki }（空き表は表の中のスクロール位置）
+// 端末の「戻る」（Android の戻るボタン・iPhone の左端からなぞる）用に、一覧以外の画面のあいだだけ履歴を1つ積んでおく
+// → 一覧以外で「戻る」を押すとアプリの「‹」と同じ動き、一覧で押すと今までどおりアプリが閉じる
+// iPhone のホーム画面アプリは端末の「戻る」がない（左端からなぞるのはアプリ側で見ている）ので履歴は使わない
+// （履歴を戻すと iOS がスクロール位置を一番上に戻してしまうため）
+let ignorePop = false;
+const useNavHistory = () => !(isIOS && isStandalone());
+const hasNavEntry = () => !!(history.state && history.state.sharyo);
+if ("scrollRestoration" in history) history.scrollRestoration = "manual"; // ブラウザ自身のスクロール復元とぶつからないように
+// 一覧に戻ったときの位置（描き直しや履歴の処理のあとにも、もう一度合わせる）
+function applyListPos() {
+  const s = ui.screen;
+  if (s.name === "list" && s.restore && listPos && listPos.tab === ui.tab) setScrollPos(listPos);
+}
+// 今のスクロール位置（空き表は表の中、ほかは画面全体）
+const akiScroller = () => document.querySelector(".aki-scroll");
+// スマホの空き表は、縦は外の枠（.aki-scroll）、横は中の枠（.a-h）が動く
+const akiHz = a => (a && a.querySelector(".a-h")) || a;
+function scrollPos() {
+  const a = akiScroller();
+  return a ? { aki: true, top: a.scrollTop, left: akiHz(a).scrollLeft } : { top: $("ph-screen").scrollTop };
+}
+function setScrollPos(p) {
+  const a = akiScroller();
+  if (!p.aki) { $("ph-screen").scrollTop = p.top; return; }
+  if (!a) return;
+  a.scrollTop = p.top; akiHz(a).scrollLeft = p.left;
+  const head = a.parentElement.querySelector(".a-hhead"); if (head) head.scrollLeft = akiHz(a).scrollLeft; // 上の日付の行もそろえる
+}
+function go(s, fromPop) {
+  const sc = $("ph-screen"), wasList = ui.screen.name === "list", toList = s.name === "list";
+  if (wasList && !toList) listPos = { tab: ui.tab, ...scrollPos() };
+  hideSheet();
+  ui.screen = s; ui.menu = false; form.err = ""; render();
+  sc.scrollTop = 0; applyListPos();
+  if (toList && s.restore) requestAnimationFrame(applyListPos);
+  if (!useNavHistory()) return;
+  if (fromPop) { if (!toList) history.pushState({ sharyo: 1 }, ""); } // 1段戻っても、まだ一覧でなければ積み直す
+  else if (wasList && !toList && !hasNavEntry()) history.pushState({ sharyo: 1 }, "");
+  else if (toList && hasNavEntry()) { ignorePop = true; history.back(); } // 「‹」やタブで一覧に戻ったら、積んだ分を外す
+}
+const goBack = () => go(ui.backTo || { name: "list", restore: true });
+function setTab(t) { ui.tab = t; go({ name: "list" }); }
+
+function render() {
+  if (ui.view === "phone") renderPhone();
+  else { renderPc(); if (ui.pcRes) renderResModal(); }
+  loadImages();
+}
+
+/* ---------- 写真の読み込み（一覧は画面に入る少し手前から、詳細は小さい写真→大きい写真） ---------- */
+const LAZY_MARGIN = "600px 0px";
+const lazyObservers = new Map(), lazyObserversAki = new WeakMap(); // 空き表は描き直すたびに表の枠が新しくなるので WeakMap
+function lazyObserver(root) {
+  if (root && root.classList.contains("aki-scroll")) {
+    if (!lazyObserversAki.has(root)) lazyObserversAki.set(root, new IntersectionObserver(entries => entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const img = e.target; lazyObserversAki.get(root).unobserve(img);
+      if (img.dataset.src) { img.src = img.dataset.src; img.removeAttribute("data-src"); }
+    }), { root, rootMargin: "300px" }));
+    return lazyObserversAki.get(root);
+  }
+  if (!lazyObservers.has(root)) {
+    const obs = new IntersectionObserver(entries => entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const img = e.target; obs.unobserve(img);
+      if (img.dataset.src) { img.src = img.dataset.src; img.removeAttribute("data-src"); }
+    }), { root, rootMargin: LAZY_MARGIN });
+    lazyObservers.set(root, obs);
+  }
+  return lazyObservers.get(root);
+}
+function loadImages(scope = document) {
+  scope.querySelectorAll("img[data-src]").forEach(img => {
+    if (!("IntersectionObserver" in window)) { img.src = img.dataset.src; img.removeAttribute("data-src"); return; }
+    lazyObserver(img.closest(".aki-scroll") || img.closest("#ph-screen") || null).observe(img); // 空き表は表の枠、スマホは一覧の枠、PC は画面全体を基準に
+  });
+  scope.querySelectorAll("img[data-full]").forEach(img => {
+    const full = img.dataset.full; img.removeAttribute("data-full");
+    const pre = new Image(); pre.decoding = "async";
+    pre.onload = () => { if (img.isConnected) img.src = full; };
+    pre.src = full;
+  });
+}
+// データが届いたときの描き直し。スマホで入力中なら、キーボードが閉じないよう後回しにする
+function refresh() {
+  const a = document.activeElement;
+  const typing = a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && !["file", "radio", "checkbox", "button", "submit"].includes(a.type);
+  if (ui.view === "phone" && typing && $("ph-screen").contains(a)) return;
+  if (ui.view !== "phone" && typing && $("modal").contains(a)) return; // PC：予約の画面などで入力中
+  if (a && a.dataset && a.dataset.avail) return; // PC：預けられる日を選んでいる途中は描き直さない
+  // データが届いて描き直しても、今のスクロール位置のまま（空き表は表の中の位置も）
+  const sc = $("ph-screen"), top = sc.scrollTop, ak = akiScroller() && scrollPos();
+  render();
+  if (ui.view === "phone" && sc.scrollTop !== top) sc.scrollTop = top;
+  if (ak) setScrollPos(ak);
+}
+
+/* ================= スマホ版 ================= */
+function renderPhone() {
+  const h = $("ph-header"), s = $("ph-screen"), t = $("ph-tabs");
+  // 初回は名前を選んでもらう
+  if (!ME) { h.innerHTML = S.membersLoaded ? `<h1>はじめに</h1>` : `<h1>社用車</h1>`; s.innerHTML = errBar() + nameScreen(true); t.hidden = true; return; }
+  t.hidden = false;
+  // 空き表は表の中だけスクロールする（画面全体は動かさない）
+  const akiOn = ui.tab === "aki" && ui.screen.name === "list";
+  s.classList.toggle("aki-mode", akiOn); $("phone").classList.toggle("aki-on", akiOn);
+  t.innerHTML = [["cars", "🚐", "車両"], ["aki", "📅", "空き表"], ["shaken", "📋", "車検"], ["repair", "🔧", "修理"]].map(([k, ic, l]) =>
+    `<button class="${ui.tab === k ? "on" : ""}" data-act="tab" data-val="${k}"><span class="ic">${ic}</span>${l}${k === "repair" && openCount() ? `<span class="badge">${openCount()}</span>` : ""}</button>`).join("");
+  if (ui.screen.name === "me" || ui.screen.name === "notify") {
+    ui.backTo = { name: "list", restore: true }; ui.menu = false;
+    h.innerHTML = `<button class="back" data-act="back" aria-label="戻る">‹</button><h1>${ui.screen.name === "me" ? "あなたの名前" : "🔔 通知"}</h1>`;
+    s.innerHTML = ui.screen.name === "me" ? nameScreen(false) : notifyScreen(); return;
+  }
+
+  let title = "社用車", back = null, body = "", pill = "";
+  const d = today(), sc = ui.screen;
+  if (sc.name === "list") {
+    pill = `<button class="me-pill" data-act="meMenu" aria-haspopup="menu" aria-expanded="${!!ui.menu}">${esc(ME)}</button>`
+      + (ui.menu ? `<div class="me-menu" role="menu"><button role="menuitem" data-act="meEdit">名前を変える</button><button role="menuitem" data-act="goNotify">🔔 通知</button><div class="me-ver">版 ${APP_VERSION}</div></div>` : "");
+    if (ui.tab === "cars") body = listCars();
+    else if (ui.tab === "aki") { title = "空き表"; body = akiHtml(false); }
+    else if (ui.tab === "shaken") { title = "車検"; body = listShaken(); }
+    else { title = "修理依頼"; body = listRepairs(); }
+    if (ui.tab !== "aki") body = (ui.tab === "cars" ? pushBar() : "") + myBar() + body;
+  } else if (sc.name === "done") {
+    title = ""; body = doneScreen(sc);
+  } else {
+    const v = byId(sc.id);
+    if (!v || v.retired || v.hidden) { ui.screen = { name: "list" }; return renderPhone(); }
+    // 空き表から開いた予約は、空き表に戻る
+    back = sc.name === "detail" ? { name: "list", restore: true } : (sc.back || { name: "detail", id: v.id });
+    if (sc.name === "detail") { title = esc(v.kind); body = detail(v); }
+    if (sc.name === "reserve") { title = "予約"; body = reserveForm(v); }
+    if (sc.name === "return") { title = "返却"; body = returnForm(v); }
+    if (sc.name === "repair") { title = "修理を頼む"; body = repairForm(v); }
+    if (sc.name === "check") { if (!checkOn()) { ui.screen = { name: "list" }; return renderPhone(); } title = "点検"; body = checkForm(v); }
+  }
+  ui.backTo = back;
+  h.innerHTML = `${back ? `<button class="back" data-act="back" aria-label="戻る">‹</button>` : ""}<h1>${title}</h1><span class="today">${d.getMonth() + 1}/${d.getDate()}（${DOW[d.getDay()]}）</span>${pill}`;
+  s.innerHTML = errBar() + body;
+  if (akiOn) bindAkiSync(s);
+}
+// スマホの空き表：横に動く中の枠を動かしたら、上の日付・空き台数の行も同じだけ横に動かす
+function bindAkiSync(s) {
+  const hz = s.querySelector(".a-h"), head = s.querySelector(".a-hhead"), v = s.querySelector(".a-v");
+  if (!hz || !head) return;
+  // 外の枠に縦のスクロールバーが見えるとき（PCでスマホ版を見たときなど）は、その幅だけ上の行を広げて右はしまでそろえる
+  const sb = v ? v.offsetWidth - v.clientWidth : 0;
+  if (sb > 0) head.firstElementChild.style.paddingRight = `${sb}px`;
+  const sync = () => { head.scrollLeft = hz.scrollLeft; };
+  hz.addEventListener("scroll", sync, { passive: true });
+  sync();
+}
+
+let meQuery = "";
+function nameScreen(first) {
+  if (!S.membersLoaded) return `<div class="loading">読み込み中…</div>`; // 名簿が届くまでは「読み込み中…」だけ
+  return `<div class="welcome">${first
+    ? `<h2>あなたの名前を選んでください</h2><p class="sub" style="margin:0 0 14px">このスマホに覚えておきます。予約するとき自動で入ります</p>`
+    : `<p class="sub" style="margin:0 0 14px">今は「${esc(ME)}」です。変えるなら選んでください</p>`}
+  <input type="search" id="meSearch" class="nsearch" placeholder="名前で探す" value="${esc(meQuery)}" autocomplete="off" aria-label="名前で探す">
+  <div id="meList">${nameChips(meQuery, ME, "me")}</div></div>`;
+}
+
+function listShaken() {
+  if (!S.ready) return `<div class="loading">読み込み中…</div>`;
+  const vs = byShaken(shown());
+  if (!vs.length) return `<div class="empty">まだ車が登録されていません</div>`;
+  return `<p class="sub" style="margin-top:0">期限が近い順</p>` + vs.map(v => `
+  <div class="li tap" data-act="detail" data-id="${v.id}" role="button" tabindex="0">
+    ${plateHtml(v, true)}<div class="grow"><div class="t">${esc(v.kind)}</div><div class="s">${jp(v.shakenDate)}</div></div>
+    ${shakenDays(v)}</div>`).join("");
+}
+
+function listCars() {
+  if (!S.ready) return `<div class="loading">読み込み中…</div>`;
+  const all = shown();
+  if (!all.length) return `<div class="empty">まだ車が登録されていません。<br>事務所のPCから登録してください</div>`;
+  const byType = all.filter(v => ui.tfilter === "all" || v.type === ui.tfilter);
+  const match = matchFilter;
+  const n = k => byType.filter(v => match(v, k)).length;
+  const nt = t => all.filter(v => (t === "all" || v.type === t) && match(v, ui.filter)).length;
+  const list = byType.filter(v => match(v, ui.filter));
+  return `<div class="chips four">
+    ${[["all", "全部"], ["free", "空き"], ["use", "使用中"], ["own", "専用"]].map(([k, l]) => `<button class="chip ${ui.filter === k ? "on" : ""}" data-act="filter" data-val="${k}">${l}<span class="n">${n(k)}</span></button>`).join("")}
+  </div><div class="chips types">
+    ${[["all", "全種類"], ...TYPES.map(t => [t, t])].map(([k, l]) => `<button class="chip ${ui.tfilter === k ? "on" : ""}" data-act="tfilter" data-val="${k}">${l}<span class="n">${nt(k)}</span></button>`).join("")}
+  </div>` + (list.length ? "" : `<div class="empty">この条件の車はありません</div>`) + list.map(v => {
+    const st = status(v), use = currentUse(v), fix = fixRepair(v);
+    return `
+  <button class="card" data-act="detail" data-id="${v.id}">
+    <div class="band ${statusView(v, st, use).cls}"><span>${esc(statusView(v, st, use).label)}</span>${bandExtra(v, st, use)}</div>
+    <div class="body">
+      ${thumbHtml(v)}
+      <div class="meta"><div class="r1">${plateHtml(v, true)}${shakenTag(v)}</div><div class="kind">${esc(v.kind)}</div>${vehicleTags(v)}<div class="who">${useText(v, use, fix)}</div></div>
+    </div>
+  </button>`;
+  }).join("");
+}
+
+function detail(v) {
+  const st = status(v), fix = fixRepair(v), insp = st === "insp";
+  const use = insp ? null : currentUse(v); // 車検中は、使っている人・置いてある場所を出さない
+  const rows = [
+    ["状態", `<span class="status-pill ${statusView(v, st, use).cls}">${esc(statusView(v, st, use).label)}</span>${insp ? `<div class="insnote">${inspText(v.inspection)}</div>` : ""}`],
+    use ? ["使っている人", esc(use.who) + "さん"] : null,
+    use ? ["現場", esc(use.site)] : null,
+    use ? ["いつまで", isOverdue(use) ? `<span class="warn">${fmt(use.to)} まで（返却予定を過ぎています）</span>` : `${fmt(use.to)} まで`] : null,
+    !use && !insp && !(fix && fix.shop) ? ["置いてある場所", esc(lotOf(v))] : null, // 整備工場預かり中は出さない
+    fix ? ["修理", `<span class="warn">${esc(repairText(fix))}</span>${fix.shop ? `<div class="insnote shopnote">${shopText(fix)}</div>` : ""}`] : null,
+    [insp ? "車検満了日" : "車検", `<span class="${shakenClass(v) ? "warn" : ""}">${jp(v.shakenDate)}（${shakenText(v)}）</span>`],
+    v.owner ? ["専用", `${esc(v.owner)}さん専用`] : null,
+    licOf(v) !== "普通" ? ["必要な免許", `${licOf(v)}以上<div class="licnote">${esc(LICENSE_NOTE[licOf(v)])}</div>`] : null,
+    checkOn() && !insp && st !== "fix" ? ["今日の点検", checkStateText(v)] : null,
+  ].filter(Boolean);
+  // 点検（使える車だけ。予約とは別に、いつでもできる）
+  const ckBtn = checkOn() && !insp && st !== "fix" && !S.checkErr
+    ? `<button class="btn ghost" data-act="ckStart" data-id="${v.id}" data-val="detail">${checkOf(v.id, ymd(today())) ? "点検をやり直す" : "点検する"}</button>` : "";
+  const actions = insp
+    ? `<button class="btn primary" disabled>この車を予約する</button><p class="ownnote">車検中のため予約できません</p>`
+    : st === "use"
+    ? `<button class="btn primary" data-act="goto" data-val="return" data-id="${v.id}">返却する</button>`
+    : (st === "free" ? (canReserve(v) ? `<button class="btn primary" data-act="goto" data-val="reserve" data-id="${v.id}">この車を予約する</button>`
+      : `<p class="ownnote">この車は${esc(v.owner)}さん専用です</p>`) : "");
+  return `<div class="hero">${thumbHtml(v, true, true)}${plateHtml(v)}${vehicleTags(v)}${photoBtn(v)}</div>
+  <div class="rows">${rows.map(([k, val]) => `<div class="row"><span class="k">${k}</span><span class="v">${val}</span></div>`).join("")}</div>
+  <div class="actions">${actions}${ckBtn}<button class="btn ghost" data-act="goto" data-val="repair" data-id="${v.id}">修理を頼む</button>
+    ${st === "use" && canReserve(v) ? `<button class="btn ghost" data-act="goto" data-val="reserve" data-id="${v.id}">この車を予約する</button>` : ""}</div>
+  ${calendar(v)}
+  ${resList(v)}`;
+}
+
+// 今月のカレンダー（予約・使用中の日をオレンジ、今日を枠線）
+// 車の詳細のカレンダー（月を前後に切り替えられる。予約の日だけ色を付けるので飛び飛びでも分かる）
+let detMonth = 0; // 今月から何か月先か
+function calendar(v) {
+  const td = today(), base = new Date(td.getFullYear(), td.getMonth() + detMonth, 1), y = base.getFullYear(), m = base.getMonth();
+  const first = new Date(y, m, 1), last = new Date(y, m + 1, 0);
+  const lo = ymd(first), hi = ymd(last), resOn = new Map(); // 日 → その日の予約
+  S.reservations.filter(r => r.vehicleId === v.id && !r.returnedAt && (r.to >= lo || isOverdue(r)) && r.from <= hi).forEach(r => {
+    const end = isOverdue(r) ? ymd(today()) : r.to;
+    for (let d = parse(r.from > lo ? r.from : lo); ymd(d) <= end && ymd(d) <= hi; d.setDate(d.getDate() + 1)) if (!resOn.has(ymd(d))) resOn.set(ymd(d), r);
+  });
+  // 空いている日（今日から先）を押すと予約、予約の日（オレンジ）を押すと誰がいつまで使うか。過去の日は押せない
+  // 車検中・修理中の日は紫・赤にして、押すと予約できない理由を出す
+  const t = ymd(td), bd = blockedDays(v), can = canReserve(v), seen = new Set();
+  let cells = [..."日月火水木金土"].map(d => `<div class="d dow">${d}</div>`).join("");
+  for (let i = 0; i < first.getDay(); i++) cells += `<div class="d blank"></div>`;
+  for (let d = 1; d <= last.getDate(); d++) {
+    const k = ymd(new Date(y, m, d)), r = resOn.get(k), why = bd.get(k);
+    const cls = r ? "use" : why === "車検" ? "insp" : why === "修理" ? "fix" : "";
+    if (cls) seen.add(cls);
+    const c = `d ${cls}${k === t ? " today" : ""}`;
+    cells += k < t ? `<div class="${c}">${d}</div>`
+      : r ? `<button type="button" class="${c}" data-act="detRes" data-val="${r.id}" aria-label="${dayLabel(k)} ${esc(r.who)}さんの予約">${d}</button>`
+      : can ? `<button type="button" class="${c}" data-act="detDay" data-id="${v.id}" data-val="${k}" aria-label="${dayLabel(k)}${why ? `（${why}）` : " 空き"}">${d}</button>`
+      : `<div class="${c}">${d}</div>`;
+  }
+  const next = nextRes(v);
+  const lg = [["use", "予約・使用中"], ["insp", "車検中"], ["fix", "修理中"]].filter(([k]) => k === "use" || seen.has(k)).map(([k, l]) => `<i class="${k}"></i>${l}`).join("　");
+  return `<div class="cal">${lateWarn(v)}<div class="cal-head"><button type="button" class="pcal-nav" data-act="detMonth" data-val="-1"${detMonth <= 0 ? " disabled" : ""} aria-label="前の月">‹</button><h3>${y !== td.getFullYear() ? `${y}年` : ""}${m + 1}月の予定</h3><button type="button" class="pcal-nav" data-act="detMonth" data-val="1"${detMonth >= 12 ? " disabled" : ""} aria-label="次の月">›</button></div><div class="grid">${cells}</div>
+  <div class="legend">${lg}${next ? ` ／ 次の予約：${rangeText(next)} ${esc(next.who)}さん（${esc(next.site)}）` : ""}</div>
+  ${can ? `<p class="cal-note">空いている日を押すと予約できます</p>` : ""}</div>`;
+}
+// 返却予定を過ぎて返していない予約がある車：予約画面とカレンダーの上に1行の注意
+const lateWarn = v => (S.reservations.some(r => r.vehicleId === v.id && isOverdue(r)) ? `<p class="latewarn">⚠ この車は今、返却が遅れています</p>` : "");
+// 車の詳しい画面のカレンダーで日を押したとき：空いていれば予約の画面（押した日が借りる日）、使えない日は理由を出す
+function detPickDay(vid, day) {
+  const v = byId(vid); if (!v || day < ymd(today())) return;
+  const why = blockedDays(v).get(day);
+  if (!why) { openReserve(v.id, day, { name: "detail", id: v.id }); return; }
+  const late = why === "予約" && S.reservations.some(r => r.vehicleId === v.id && isOverdue(r));
+  openSheet(`<h3>この日は予約できません</h3>${akiCarHead(v)}<p><b>${dayLabel(day)}</b></p>
+    <p>${late ? "返却予定を過ぎて、まだ返却されていません。今日は予約できません（明日からなら予約できます）" : `この日は${BLOCK_IS[why]}`}</p>`);
+}
+
+// この車のこれからの予約（使用中は除く）。取り消せるものには「取り消す」
+function resList(v) {
+  const t = ymd(today());
+  const list = S.reservations.filter(r => r.vehicleId === v.id && !r.returnedAt && r.from > t).sort((a, b) => (a.from > b.from ? 1 : -1));
+  if (!list.length) return "";
+  return `<div class="reslist"><h3>この車の予約</h3>${list.map(r => `<div class="resrow"><div class="grow"><b>${rangeText(r)}</b><span>${esc(r.who)}さん　${esc(r.site)}</span></div>
+    ${canCancel(r) ? `<button class="btn ghost small" data-act="cancelRes" data-id="${r.id}">取り消す</button>` : ""}</div>`).join("")}</div>`;
+}
+
+/* ---------- 空き表（縦に車・横に今日から4週間。スマホの「📅 空き表」タブと PC の「空き表」タブ） ---------- */
+const AKI_DAYS = 28;
+const akiUi = { type: TYPES.includes(lsGet("taiyo_aki_type")) ? lsGet("taiyo_aki_type") : "all" }; // 種類の絞り込み
+const AKI_KIND = { use: "予約・使用中", fix: "修理中", insp: "車検中" };
+// 表に出す車：廃車・隠している車・専用車両・サンプルの車は出さない（見本 sharyo-demo ではサンプルの車も出す）。種類ごと（トラック／バン／普通車）に並べる
+const akiCars = () => shown().filter(v => !v.owner && (DEMO || !v.sample))
+  .map((v, i) => [v, i]).sort((a, b) => (TYPES.indexOf(a[0].type) - TYPES.indexOf(b[0].type)) || (a[1] - b[1])).map(x => x[0]);
+// 車ごとの帯：予約・使用中（返却遅れは今日まで伸ばす）／修理中／車検中
+function akiBlocks(cars) {
+  const t = ymd(today()), map = new Map(cars.map(v => [v.id, []]));
+  S.reservations.forEach(r => {
+    const l = map.get(r.vehicleId); if (!l || r.returnedAt) return;
+    const late = isOverdue(r);
+    l.push({ k: "use", from: r.from, to: late ? t : r.to, late, r });
+  });
+  cars.forEach(v => {
+    const l = map.get(v.id), ib = inspBlock(v);
+    if (ib) l.push({ k: "insp", ...ib, v });
+    repairsOf(v).forEach(r => l.push({ k: "fix", ...repairBlock(r), rep: r }));
+  });
+  return map;
+}
+let akiList = []; // いま表に出ている帯（押したときに中身を出すため）
+// 小さいナンバープレート（車種は押したときに出す）
+const akiPlate = v => `<span class="aplate"><span class="t">${esc(v.plateArea)} ${esc(v.plateClass)}</span><span class="b"><span class="h">${esc(v.plateKana)}</span><span class="n">${esc(v.plateNum)}</span></span></span>`;
+function akiHtml(pc) {
+  if (!S.ready) return `<div class="loading">読み込み中…</div>`;
+  const all = akiCars();
+  if (!all.length) return `<div class="empty">表に出せる車がありません</div>`;
+  const N = AKI_DAYS, td = today(), di = s => Math.round((parse(s) - td) / 86400000);
+  const cars = all.filter(v => akiUi.type === "all" || v.type === akiUi.type);
+  const blocks = akiBlocks(cars);
+  const days = Array.from({ length: N }, (_, i) => addDays(td, i));
+  // 空き台数：どの帯にも当たらない車だけ数える
+  const busy = new Array(N).fill(0);
+  cars.forEach(v => {
+    const hit = new Uint8Array(N);
+    blocks.get(v.id).forEach(b => { for (let i = Math.max(0, di(b.from)), e = Math.min(N - 1, di(b.to)); i <= e; i++) hit[i] = 1; });
+    hit.forEach((x, i) => { busy[i] += x; });
+  });
+  const low = Math.max(1, Math.round(cars.length * 0.15));
+  const n = k => all.filter(v => k === "all" || v.type === k).length;
+  const corner = `<div class="a-corner">車</div>`, cnth = `<div class="a-cnth">空き台数</div>`;
+  const hds = days.map((d, i) => {
+    const w = d.getDay();
+    return `<div class="a-hd${redDay(d) ? " sun" : w === 6 ? " sat" : ""}${i === 0 ? " today" : ""}"><b>${d.getDate() === 1 && i ? `${d.getMonth() + 1}/1` : d.getDate()}</b>${i === 0 ? "今日" : DOW[w]}</div>`;
+  }).join("");
+  const cnts = days.map((d, i) => `<div class="a-cnt${cars.length - busy[i] <= low ? " low" : ""}${i === 0 ? " today" : ""}">${cars.length - busy[i]}</div>`).join("");
+  // 日の枠：50台×28日でもスマホで重くならないよう、1台＝1つの行にして、土日・今日の色と区切り線は背景で描く
+  // （押した日は、押した位置から計算する）
+  const bg = days.map((d, i) => `${i === 0 ? "var(--a-today)" : d.getDay() % 6 === 0 || redDay(d) ? "var(--a-wkend)" : "transparent"} calc(var(--dayw) * ${i}) calc(var(--dayw) * ${i + 1})`).join(",");
+  akiList = [];
+  let grp = "";
+  const names = [], tracks = []; // 左の車の列・横に動く日の行（同じ順に並べる）
+  cars.forEach(v => {
+    if (akiUi.type === "all" && v.type !== grp) { grp = v.type; names.push(`<div class="a-gname">${esc(grp)}</div>`); tracks.push(`<div class="a-gtrack"></div>`); }
+    names.push(`<div class="a-name" data-act="akiCar" data-id="${v.id}" role="button" tabindex="0" title="${esc(v.kind)}">${pc ? `<span class="a-thumb">${thumbHtml(v)}</span>` : ""}${akiPlate(v)}</div>`);
+    let t = `<div class="a-track" data-act="akiCell" data-id="${v.id}" aria-label="${esc(v.plateKana)}${esc(v.plateNum)}：空いている日を押すと予約できます">`;
+    blocks.get(v.id).forEach(b => {
+      const s = di(b.from), e = di(b.to); if (e < 0 || s >= N) return;
+      const ix = akiList.push(b) - 1;
+      const main = b.k === "use" ? b.r.who : b.k === "fix" ? "修理" : "車検";
+      const sub = pc ? (b.k === "use" ? b.r.site : b.k === "fix" && b.rep.shop ? `${b.rep.shop.shop || SHOP_NAME}預かり` : "") : "";
+      t += `<button class="a-blk ${b.k}${b.late ? " late" : ""}${s < 0 ? " cont-l" : ""}${e >= N ? " cont-r" : ""}" style="grid-column:${Math.max(s, 0) + 1} / ${Math.min(e, N - 1) + 2}" data-act="akiBlk" data-val="${ix}"><span>${b.late ? `<i class="lt">遅れ</i>` : ""}${esc(main)}</span>${sub ? `<small>${esc(sub)}</small>` : ""}</button>`;
+    });
+    tracks.push(t + `</div>`);
+  });
+  const gridVars = `--days:${N};--daybg:linear-gradient(90deg,${bg})`;
+  // PC：今まで通り1つの枠（縦横とも同じ枠が動き、左の列・上の行は sticky で止める）
+  // スマホ：縦に動く外の枠（左の車の列＋横に動く中の枠）と、上の日付・空き台数の行（中の枠と一緒に横に動かす）に分ける
+  //        縦の指は外の枠、横の指は中の枠が受け持つので、ブラウザ本来のスクロールのまま斜めにふらつきにくい
+  const board = pc
+    ? `<div class="a-board"><div class="aki-scroll"><div class="a-grid" style="${gridVars}">${corner}${hds}${cnth}${cnts}${names.map((x, i) => x + tracks[i]).join("")}</div></div></div>`
+    : `<div class="a-board a-split" style="${gridVars}">
+        <div class="a-headrow"><div class="a-headl">${corner}${cnth}</div><div class="a-hhead"><div class="a-hgrid">${hds}${cnts}</div></div></div>
+        <div class="aki-scroll a-v"><div class="a-vin"><div class="a-names">${names.join("")}</div><div class="a-h"><div class="a-rows">${tracks.join("")}</div></div></div></div>
+      </div>`;
+  const types = [["all", "全部"], ...TYPES.map(t => [t, t])];
+  const legend = `<div class="a-legend"><span><i class="use"></i>予約・使用中</span><span><i class="fix"></i>修理中</span><span><i class="insp"></i>車検中</span><span><i class="late"></i>赤いふち＝返却遅れ</span><span><i class="free"></i>空き</span></div>`;
+  // PC：種類のタブ（1行の細めの形）・期間・色の説明を1段にまとめる
+  const top = pc
+    ? `<div class="a-bar"><div class="a-ptabs">${types.map(([k, l]) =>
+        `<button class="${akiUi.type === k ? "on" : ""}" data-act="akiType" data-val="${k}" aria-pressed="${akiUi.type === k}">${l}<span class="n">${n(k)}台</span></button>`).join("")}</div>
+        <span class="a-span">${dayLabel(ymd(td))}から4週間</span>${legend}</div>`
+    : `<div class="chips four aki-types">${types.map(([k, l]) =>
+        `<button class="chip ${akiUi.type === k ? "on" : ""}" data-act="akiType" data-val="${k}">${l}<span class="n">${n(k)}台</span></button>`).join("")}</div>
+      ${legend}<p class="a-rot">📱 スマホを横向きにすると、もっと多くの日が見られます</p>`;
+  return `<div class="aki${pc ? " is-pc" : ""}">
+    ${top}
+    ${board}
+  </div>`;
+}
+// PC：表の高さを画面の下まで使う（表の上にあるものの高さは画面の幅で変わるので、描いたあとに測る）
+// 1日の幅は、表の中の幅（縦のスクロールバーを除く）から28日分がちょうど入るように。最低46px、区切り線がずれないよう整数にする
+function fitAki() {
+  const a = $("pc").querySelector(".aki-scroll"), g = a && a.querySelector(".a-grid"); if (!g) return;
+  a.style.maxHeight = `${Math.max(320, Math.floor(innerHeight - (a.getBoundingClientRect().top + scrollY) - 12))}px`;
+  const namew = parseFloat(getComputedStyle(g).getPropertyValue("--namew")) || 196;
+  g.style.setProperty("--dayw", `${Math.max(46, Math.floor((a.clientWidth - namew - 1) / AKI_DAYS))}px`);
+}
+addEventListener("resize", () => { if (ui.view === "pc" && pcUi.page === "aki") fitAki(); });
+
+// 空き表で押したときに下から出る小さな画面
+let sheetPushed = false; // スマホ：端末の「戻る」で閉じられるよう、履歴を1つ積んだか
+const sheetOpen = () => !!$("aveil") && !$("aveil").hidden;
+function openSheet(html) {
+  let el = $("aveil");
+  if (!el) {
+    el = document.createElement("div"); el.id = "aveil"; el.className = "aveil";
+    el.innerHTML = `<div class="asheet" role="dialog" aria-modal="true"></div>`;
+    el.addEventListener("click", e => { if (e.target === el) closeSheet(); });
+    document.body.appendChild(el);
+  }
+  el.firstElementChild.innerHTML = html + `<button type="button" class="abtn ghost" data-act="akiClose">閉じる</button>`;
+  el.hidden = false; loadImages(el);
+  // スマホ：端末の「戻る」でこの小さな画面だけ閉じられるよう、履歴を1つ積む（車の詳しい画面の上で開いたときも）
+  if (ui.view === "phone" && useNavHistory() && !sheetPushed) { history.pushState({ sharyo: 1 }, ""); sheetPushed = true; }
+  const b = el.querySelector(".abtn"); if (b) b.focus({ preventScroll: true });
+}
+// 閉じるだけ（積んだ履歴は、そのまま次の画面で使う）
+function hideSheet() { const el = $("aveil"); if (el) el.hidden = true; sheetPushed = false; }
+// 「閉じる」・外を押した：積んだ履歴も外す
+function closeSheet(fromPop) {
+  const pushed = sheetPushed; hideSheet();
+  if (!fromPop && pushed && hasNavEntry()) { ignorePop = "sheet"; history.back(); }
+}
+const akiCarHead = v => `<div class="a-who">${thumbHtml(v)}${akiPlate(v)}<span class="m">${esc(v.kind)}</span></div>`;
+function akiShowBlock(b) {
+  if (!b) return;
+  const t = ymd(today());
+  if (b.k === "use") {
+    const r = b.r, v = byId(r.vehicleId); if (!v) return;
+    openSheet(`<h3>${b.late ? "返却遅れ" : AKI_KIND.use}</h3>${akiCarHead(v)}<p><b>${dayLabel(r.from)} 〜 ${dayLabel(r.to)}</b></p>
+      ${b.late ? `<p class="a-late">返却予定日を過ぎていますが、まだ返されていません</p>` : ""}<p>${esc(r.who)}さん → ${esc(r.site)}</p>`);
+  } else if (b.k === "fix") {
+    const r = b.rep, v = byId(r.vehicleId); if (!v) return;
+    const until = r.shop && r.shop.until;
+    openSheet(`<h3>${AKI_KIND.fix}</h3>${akiCarHead(v)}<p><b>${dayLabel(b.from)} 〜 ${until ? `${dayLabel(until)}（戻り予定）` : "（戻り予定は未定）"}</b></p>
+      ${until && until < t ? `<p class="a-late">戻り予定日を過ぎています</p>` : ""}
+      <p>${r.shop ? `${esc(r.shop.shop || SHOP_NAME)} 預かり` : "修理中"}${repairText(r) ? `：${esc(repairText(r))}` : ""}</p>`);
+  } else {
+    const v = b.v, x = v.inspection || {};
+    openSheet(`<h3>${AKI_KIND.insp}</h3>${akiCarHead(v)}<p><b>${dayLabel(b.from)} 〜 ${x.until ? `${dayLabel(x.until)}（戻り予定）` : "（戻り予定は未定）"}</b></p>
+      ${x.until && x.until < t ? `<p class="a-late">戻り予定日を過ぎています</p>` : ""}<p>車検に出しています</p>`);
+  }
+}
+function akiShowCell(vid, i) {
+  const v = byId(vid); if (!v) return;
+  const d = ymd(addDays(today(), Number(i)));
+  openSheet(`<h3>この日は空いています</h3>${akiCarHead(v)}<p><b>${dayLabel(d)}</b></p>
+    <button type="button" class="abtn go" data-act="akiReserve" data-id="${v.id}" data-val="${d}">この車を予約する</button>`);
+}
+function akiShowCar(vid) {
+  const v = byId(vid); if (!v) return;
+  openSheet(`<h3>${esc(v.kind)}</h3>${akiCarHead(v)}${vehicleTags(v)}
+    ${ui.view === "phone" ? `<button type="button" class="abtn go steel" data-act="akiDetail" data-id="${v.id}">この車の詳しい画面を見る</button>` : ""}`);
+}
+
+/* ---------- 予約 ---------- */
+const SITE_OTHER = "__other";
+const plateText = v => `${esc(v.plateArea)} ${esc(v.plateClass)} ${esc(v.plateKana)} ${esc(v.plateNum)}`;
+// 同じ車で日付が重なる予約（返却済みは除く）。返却予定を過ぎて返していない予約は今日まで（明日からは予約できる）
+const effTo = r => { const t = ymd(today()); return !r.returnedAt && r.to < t ? t : r.to; };
+const findClash = (list, vid, from, to) => list.find(r => r.vehicleId === vid && !r.returnedAt && !r.canceled && r.from <= to && from <= effTo(r)) || null;
+const clashMsg = r => (effTo(r) !== r.to
+  ? `この車は返却予定（${fmt(r.to)}）を過ぎて、まだ返却されていません（${r.who}さん）。今日は予約できません（明日からなら予約できます）`
+  : `その日は予約が入っています：${fmt(r.from)}〜${fmt(r.to)} ${r.who}さん（${r.site}）`);
+class ClashError extends Error {}
+// 車検中の期間：出した日〜戻り予定日（戻り予定日がない・過ぎても戻していなければ今日まで）
+function inspBlock(v) {
+  const x = v && v.inspection; if (!x) return null;
+  const t = ymd(today());
+  return { from: x.from || t, to: x.until && x.until > t ? x.until : t };
+}
+// 修理中の期間：預けた日（なければ修理中にした日）〜戻り予定日（整備工場預かり）。戻り予定がない・過ぎたときは今日まで
+const tsYmd = x => (x && x.toDate ? ymd(x.toDate()) : null);
+function repairBlock(r) {
+  const t = ymd(today()), from = (r.shop && r.shop.from) || tsYmd(r.inRepairAt) || t;
+  const to = r.shop && r.shop.until && r.shop.until > t ? r.shop.until : t;
+  return { from, to: to < from ? from : to };
+}
+const repairsOf = v => S.repairs.filter(r => r.vehicleId === v.id && r.status === "in_repair");
+const repairClash = (v, from, to) => repairsOf(v).map(repairBlock).some(b => from <= b.to && b.from <= to);
+const inspClash = (v, from, to) => { const b = inspBlock(v); return !!b && from <= b.to && b.from <= to; };
+const inspMsg = v => `この車は車検中です${v.inspection.until ? `（戻り予定 ${fmt(v.inspection.until)}）` : ""}。その日は予約できません`;
+const rangeText = r => (r.from === r.to ? fmt(r.from) : `${fmt(r.from)}〜${fmt(r.to)}`);
+// 取り消せるのは、まだ始まっていない予約。スマホは予約した本人（使う人か予約した人）、PC（広い画面）は全部
+const canCancel = r => r.from > ymd(today()) && (wide.matches || (!!ME && (r.who === ME || r.createdBy === ME)));
+function cancelReservation(id) {
+  const r = S.reservations.find(x => x.id === id); if (!r) return;
+  if (!canCancel(r)) { toast("この予約は取り消せません"); return; }
+  const v = byId(r.vehicleId);
+  if (!confirm(`${rangeText(r)} ${v ? v.kind : ""}の予約を取り消しますか？`)) return;
+  // データは消さずに「取り消し済み」の印と、取り消した人・日時を残す
+  updateDoc(doc(db, "reservations", id), { canceled: true, canceledBy: ME || "事務所（PC）", canceledAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("取り消せませんでした。もう一度お試しください", "err"); });
+  toast("予約を取り消しました");
+}
+// この車で予約できない日（日付 → 理由）：ほかの予約・使用中（返却が遅れている予約は今日まで）・車検中・修理中。今日より前は見ない
+function blockedDays(v) {
+  const map = new Map(), t = ymd(today()), limit = ymd(addDays(today(), 400));
+  const put = (from, to, why) => {
+    for (let d = parse(from < t ? t : from); ymd(d) <= to && ymd(d) <= limit; d.setDate(d.getDate() + 1)) if (!map.has(ymd(d))) map.set(ymd(d), why);
+  };
+  S.reservations.filter(r => r.vehicleId === v.id && !r.returnedAt).forEach(r => put(r.from, effTo(r), "予約"));
+  const ib = inspBlock(v); if (ib) put(ib.from, ib.to, "車検");
+  repairsOf(v).forEach(r => { const b = repairBlock(r); put(b.from, b.to, "修理"); });
+  return map;
+}
+const BLOCK_IS = { 予約: "ほかの予約が入っています", 車検: "車検中です", 修理: "修理中です" };
+const BLOCK_UPTO = { 予約: "にほかの予約があるので", 車検: "は車検中なので", 修理: "は修理中なので" };
+const spanDays = (a, b) => Math.round((parse(b) - parse(a)) / 86400000) + 1;
+// 選んだ日を、続いている日ごとの予約（from〜to）にまとめる（飛び飛びの予約は、前の予約画面と同じく続いている日ごとに1件ずつ保存する）
+function toRanges(days) {
+  const out = [];
+  [...days].sort().forEach(d => {
+    const last = out[out.length - 1];
+    if (last && ymd(addDays(parse(last.to), 1)) === d) last.to = d; else out.push({ from: d, to: d });
+  });
+  return out;
+}
+const multi = () => form.mode === "multi"; // 予約カレンダーの選び方：続けて（借りる日→返す日）／飛び飛び（1日ずつ）
+// 予約画面のカレンダー（今月と来月を縦に並べる）
+function rangeMonth(y, m, blocked) {
+  const t = ymd(today()), first = new Date(y, m, 1), n = new Date(y, m + 1, 0).getDate(), e = form.e || form.s;
+  const picked = new Set(multi() ? form.days || [] : []);
+  let h = `<div class="rc-cal"><h3>${y}年${m + 1}月</h3><div class="rc-wk">${[...DOW].map((w, i) => `<div class="${i === 0 ? "sun" : i === 6 ? "sat" : ""}">${w}</div>`).join("")}</div><div class="rc-grid">`;
+  for (let i = 0; i < first.getDay(); i++) h += `<div></div>`;
+  for (let d = 1; d <= n; d++) {
+    const dt = new Date(y, m, d), s = ymd(dt), w = dt.getDay(), why = blocked.get(s);
+    const c = ["rc-d"]; if (redDay(dt)) c.push("sun"); else if (w === 6) c.push("sat"); // 日曜・祝日は赤、土曜は青
+    if (s < t) c.push("past"); else if (why) c.push("busy");
+    if (s === t) c.push("today");
+    if (multi()) { if (picked.has(s)) c.push("pick"); } // 飛び飛び：1日ずつ緑の丸（間はつながない）
+    else {
+      if (form.s && s >= form.s && s <= e) c.push("in");
+      if (s === form.s) c.push("start"); if (form.s && s === e) c.push("end");
+    }
+    const dis = s < t || !!why;
+    h += `<div class="${c.join(" ")}"${why && s >= t ? ` data-why="${why}"` : ""}><button type="button" data-act="rcDay" data-val="${s}"${dis ? ' aria-disabled="true"' : ""} aria-label="${dayLabel(s)}${why && s >= t ? `（${why}）` : ""}">${d}</button></div>`;
+  }
+  return h + `</div></div>`;
+}
+function rangePicker(v) {
+  const td = today(), blocked = blockedDays(v), e = form.e || form.s;
+  const box = (lb, val, empty, on) => `<div class="rc-box${on ? " on" : ""}"><span class="lb">${lb}</span><span class="v${val ? "" : " empty"}">${val ? dayLabel(val) : empty}</span></div>`;
+  const days = [...(form.days || [])].sort(), any = multi() ? days.length > 0 : !!form.s;
+  const mode = `<div class="rc-mode" role="group" aria-label="日の選び方">${[["range", "続けて"], ["multi", "飛び飛び"]].map(([k, l]) =>
+    `<button type="button" class="${(multi() ? "multi" : "range") === k ? "on" : ""}" data-act="rcMode" data-val="${k}" aria-pressed="${(multi() ? "multi" : "range") === k}">${l}</button>`).join("")}</div>`;
+  const top = multi()
+    ? `<div class="rc-pick multi"><span class="lb">使う日</span><span class="v${days.length ? "" : " empty"}">${days.length ? `${days.map(dayLabel).join("・")}<b>${days.length}日</b>` : "日を押す（何日でも選べます）"}</span></div>`
+    : `<div class="rc-pick">${box("借りる日", form.s, "日を押す", !form.s)}<span class="rc-arrow">→</span>${box("返す日", form.e, form.s ? "日を押す" : "―", !!form.s && !form.e)}</div>`;
+  const sum = multi()
+    ? (days.length ? "もう一度押すと外れます" : "使う日を1日ずつ押してください")
+    : (form.s ? `${spanDays(form.s, e)}日間${form.e ? "" : "<small>（1日だけなら、このまま予約できます）</small>"}` : "借りる日を押してください");
+  return `<div class="rc">
+    ${mode}${top}
+    <div class="rc-sum"><p class="rc-days${multi() ? " sub2" : ""}">${sum}</p>
+      <button type="button" class="rc-clr" data-act="rcClear"${any || form.rmsg ? "" : " disabled"}>やり直す</button></div>
+    ${form.rmsg ? `<p class="rc-msg">${esc(form.rmsg)}</p>` : ""}
+    ${rangeMonth(td.getFullYear(), td.getMonth(), blocked)}${rangeMonth(td.getFullYear(), td.getMonth() + 1, blocked)}
+    <div class="rc-legend"><span><i class="rc-on"></i>選んだ日</span><span><i class="rc-today"></i>今日</span><span><s>12</s>＝予約・車検・修理で使えない日</span></div>
+  </div>`;
+}
+// 日を押したとき：1回目＝借りる日、2回目＝返す日（間に使えない日があれば選べない）
+function pickRange(s) {
+  const v = byId(form.vid); if (!v || form.busy) return;
+  const blocked = blockedDays(v), t = ymd(today());
+  form.rmsg = ""; form.err = "";
+  if (s < t) return;
+  if (blocked.has(s)) form.rmsg = `${dayLabel(s)} は${BLOCK_IS[blocked.get(s)]}`;
+  else if (multi()) { const d = form.days || []; form.days = d.includes(s) ? d.filter(x => x !== s) : [...d, s]; } // 飛び飛び：押すたびに付ける・外す
+  else if (!form.s || form.e || s < form.s) { form.s = s; form.e = null; }
+  else {
+    let hit = null;
+    for (let d = parse(form.s); ymd(d) <= s; d.setDate(d.getDate() + 1)) if (blocked.has(ymd(d))) { hit = ymd(d); break; }
+    if (hit) form.rmsg = `${dayLabel(hit)} ${BLOCK_UPTO[blocked.get(hit)]}、ここまでは選べません`;
+    else form.e = s;
+  }
+  render();
+}
+// 予約の画面を開く（空き表から：その車と、押した日を借りる日に入れて）。スマホは画面、PCは小さな画面で
+function openReserve(vid, day, back = { name: "list", restore: true }) {
+  const v = byId(vid); if (!v) return;
+  resetForm(); form.vid = v.id;
+  if (day) {
+    const why = blockedDays(v).get(day);
+    if (day < ymd(today())) { /* 過ぎた日は入れない */ } else if (why) form.rmsg = `${dayLabel(day)} は${BLOCK_IS[why]}`; else form.s = day;
+  }
+  if (ui.view === "phone") go({ name: "reserve", id: v.id, back });
+  else { ui.pcRes = v.id; render(); }
+}
+// PC：予約の画面（車両の修正と同じ形の小さな画面）。データが届いて描き直しても、見ている位置はそのまま
+function renderResModal() {
+  const v = byId(ui.pcRes);
+  if (!v || v.retired) { closeModal(); return; }
+  const ov = $("modal").querySelector(".overlay.resov"), top = ov ? ov.scrollTop : 0;
+  $("modal").innerHTML = `<div class="overlay resov"><div class="modal panel rmodal" role="dialog" aria-modal="true" aria-label="予約">
+    <h2>予約<button type="button" class="x" data-act="close" aria-label="閉じる">×</button></h2>
+    <div class="mbody">${reserveForm(v)}</div></div></div>`;
+  $("modal").hidden = false;
+  $("modal").querySelector(".overlay").scrollTop = top;
+}
+const resOpen = () => (ui.view === "phone" ? ui.screen.name === "reserve" : !!ui.pcRes);
+
+function reserveForm(v) {
+  if (form.vid !== v.id) { resetForm(); form.vid = v.id; }
+  if (!ME && !form.other) { form.other = true; form.picking = true; } // PC（名前なし）は使う人を選ぶ
+  form.site = form.site || "";
+  const sites = S.settings.sites || [];
+  const lic = licOf(v);
+  const meBtn = ME ? `<button class="chip" style="margin-top:8px" data-act="whoMe">自分に戻す</button>` : "";
+  return `<div class="sheet-title">${esc(v.kind)}</div><p class="sub">${plateText(v)}</p>
+  ${lic !== "普通" ? `<div class="licwarn">⚠ この車は${lic}以上の免許が必要です<small>${esc(LICENSE_NOTE[lic])}</small></div>` : ""}
+  ${lateWarn(v)}<div class="field">${rangePicker(v)}</div>
+  <div class="field"><label>使う人</label>${!form.other
+    ? `<div class="mine"><span>${esc(ME)}さん（自分）</span><button class="sw" data-act="whoOther">別の人にする</button></div>`
+    : (form.who && !form.picking
+      ? `<div class="mine"><span>${esc(form.who)}さん</span><button class="sw" data-act="whoOther">変える</button></div>${meBtn}`
+      : `<div class="picker"><input type="search" id="whoSearch" class="nsearch" placeholder="名前で探す" value="${esc(form.whoQ || "")}" autocomplete="off" aria-label="使う人を名前で探す">
+          <div id="whoList">${nameChips(form.whoQ, form.who, "pickWho")}</div>
+          ${meBtn}</div>`)}</div>
+  <div class="field"><label for="f-site">行く現場</label><select id="f-site" name="site"><option value="">選んでください</option>${sites.map(p => `<option value="${esc(p)}"${form.site === p ? " selected" : ""}>${esc(p)}</option>`).join("")}<option value="${SITE_OTHER}"${form.site === SITE_OTHER ? " selected" : ""}>その他（入力する）</option></select>
+    ${form.site === SITE_OTHER ? `<input name="siteOther" style="margin-top:8px" placeholder="現場の名前を入力" maxlength="100" value="${esc(form.siteOther || "")}" aria-label="現場の名前">` : ""}</div>
+  ${form.err ? `<p class="ferr">${esc(form.err)}</p>` : ""}
+  <div class="actions"><button class="btn primary big" data-act="reserve" data-id="${v.id}"${form.busy ? " disabled" : ""}>${form.busy ? "予約しています…" : "予約する"}</button></div>`;
+}
+
+async function doReserve(v) {
+  if (form.busy) return;
+  if (!canReserve(v)) { form.err = `この車は${v.owner}さん専用です`; render(); return; }
+  const t = ymd(today());
+  const who = form.other ? (form.picking ? "" : (form.who || "")) : ME;
+  const site = form.site === SITE_OTHER ? String(form.siteOther || "").trim() : form.site;
+  const ranges = multi() ? toRanges(form.days || []) : (form.s ? [{ from: form.s, to: form.e || form.s }] : []);
+  let err = "";
+  if (!ranges.length) err = multi() ? "使う日を選んでください" : "借りる日を選んでください";
+  else if (ranges[0].from < t) err = "過ぎた日は予約できません";
+  else if (!who || !site) err = "使う人と現場を選んでください";
+  else if (ranges.some(g => inspClash(v, g.from, g.to))) err = inspMsg(v);
+  else if (ranges.some(g => repairClash(v, g.from, g.to))) err = "この車は修理中です。その日は予約できません";
+  else { for (const g of ranges) { const c = findClash(S.reservations, v.id, g.from, g.to); if (c) { err = clashMsg(c); break; } } }
+  if (err) { form.err = err; render(); return; }
+
+  form.err = ""; form.busy = true; render();
+  const base = { vehicleId: v.id, who, site, createdBy: operator(), returnedAt: null, returnedLot: null };
+  try {
+    // 2台のスマホで同時に予約しても重ならないよう、サーバーの最新の予約で確かめてから登録する
+    await runTransaction(db, async tx => {
+      const vref = doc(db, "vehicles", v.id);
+      const vs = await tx.get(vref);
+      if (!vs.exists() || vs.data().retired) throw new ClashError("この車は予約できません");
+      const cur = vs.data();
+      if (ranges.some(g => inspClash(cur, g.from, g.to))) throw new ClashError(inspMsg(cur));
+      const snap = await getDocsFromServer(query(collection(db, "reservations"), where("vehicleId", "==", v.id), where("returnedAt", "==", null)));
+      const list = snap.docs.map(d => d.data());
+      for (const g of ranges) { const c = findClash(list, v.id, g.from, g.to); if (c) throw new ClashError(clashMsg(c)); }
+      tx.update(vref, { resSeq: increment(1), updatedAt: serverTimestamp() });
+      // 続いている日ごとに1つの予約。全部まとめて登録する（途中で1つだけ入ることはない）
+      ranges.forEach(g => tx.set(doc(collection(db, "reservations")), { ...base, from: g.from, to: g.to, createdAt: serverTimestamp() }));
+    });
+  } catch (e) {
+    console.error(e);
+    form.busy = false;
+    form.err = e instanceof ClashError ? e.message : "予約できませんでした。電波のよい所でもう一度押してください";
+    if (resOpen()) render();
+    return;
+  }
+  resetForm();
+  const msg = `${ranges.map(rangeText).join("、")}　${who}さん　${site}`;
+  // 今日から自分で使う車なら、乗る前の点検をすすめる（しなくてもよい）
+  const ck = checkOn() && who === ME && ranges.some(g => g.from === t) && checkDue(v) ? v.id : null;
+  if (ui.view === "phone") go({ name: "done", title: "予約しました", msg, check: ck });
+  else { closeModal(); render(); toast(`予約しました：${msg}`); }
+}
+
+/* ---------- 自分が使用中の車（返し忘れ防止の帯） ---------- */
+const dayLabel = s => { const d = parse(s); return `${d.getMonth() + 1}/${d.getDate()}（${DOW[d.getDay()]}）`; };
+// 自分の予約のうち、始まっていて返却していないもの（返却予定を過ぎたものも含む）
+function myUses() {
+  const t = ymd(today());
+  return S.reservations.filter(r => r.who === ME && !r.returnedAt && r.from <= t && byId(r.vehicleId) && !byId(r.vehicleId).retired)
+    .sort((a, b) => (a.to > b.to ? 1 : a.to < b.to ? -1 : 0));
+}
+function myBar() {
+  if (!ME || !S.ready) return "";
+  const uses = myUses(); if (!uses.length) return "";
+  const t = ymd(today());
+  const next = S.reservations.filter(r => r.who === ME && !r.returnedAt && r.from > t && byId(r.vehicleId) && !byId(r.vehicleId).retired)
+    .sort((a, b) => (a.from > b.from ? 1 : a.from < b.from ? -1 : 0))[0];
+  return `<div class="mybar">${uses.map(r => {
+    const v = byId(r.vehicleId), over = r.to < t;
+    return `<div class="myuse${over ? " over" : ""}">
+      <div class="mu-head">${over ? "⚠ 返却予定を過ぎています" : "あなたが使用中の車"}</div>
+      <div class="mu-body"><div class="mu-info"><b>${esc(v.kind)}</b><span class="mu-plate">${plateText(v)}</span><span class="mu-to">${dayLabel(r.to)}まで</span></div>
+        <button class="mu-btn" data-act="myReturn" data-id="${v.id}" data-val="${r.id}">返却する</button></div>${checkDue(v) ? checkAsk(v) : ""}</div>`;
+  }).join("")}${next ? `<div class="mynext-row"><button class="mynext" data-act="detail" data-id="${next.vehicleId}">次の予約：${rangeText(next)} ${esc(byId(next.vehicleId).kind)}<span>›</span></button>${canCancel(next) ? `<button class="mu-cancel" data-act="cancelRes" data-id="${next.id}">取り消す</button>` : ""}</div>` : ""}</div>`;
+}
+
+/* ---------- プッシュ通知（届く人は PC で選ぶ。本人はスマホでオフにできる） ---------- */
+const NTYPES = [
+  // 種類, PCの列の見出し, いつ, スマホのスイッチ, だれに届くか（all：社員と整備工場／staff：社員だけ／shop：整備工場だけ）
+  ["shaken", "車検", () => `${alertDays()}日前 8時`, "車検が近い", "all"],
+  ["due", "返却予定日", () => "当日 17時", "今日が返却予定日", "staff"],
+  ["overdue", "返却遅れ", () => "翌日 9時", "返却予定を過ぎた", "staff"],
+  ["repair", "修理依頼", () => "すぐ", "修理依頼が来た", "all"],
+  ["wish", "車検の希望日", () => `${SHOP_NAME}が入れたらすぐ`, `${SHOP_NAME}から車検の希望日が来た`, "staff"],
+  ["avail", "預けられる日が決まった", () => "会社が入れたらすぐ", "預けられる日が決まった", "shop"],
+];
+const STAFF_TYPES = NTYPES.filter(t => t[4] !== "shop").map(t => t[0]);
+const SHOP_TYPES = NTYPES.filter(t => t[4] !== "staff").map(t => t[0]);
+const TOKEN_KEY = "taiyo_push_token";
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () => navigator.standalone === true || matchMedia("(display-mode: standalone)").matches;
+const prefId = name => encodeURIComponent(name);
+// PC でオンにされている通知（この人の分）と、本人がオフにしたもの
+const adminOn = name => NTYPES.map(t => t[0]).filter(t => (S.notify[t] || []).includes(name));
+const myOff = () => S.prefs.get(ME) || new Set();
+// この端末の通知の状態
+function pushState() {
+  if (!VAPID_KEY) return "off"; // まだ準備できていない（公開鍵が入っていない）
+  if (isIOS && !isStandalone()) return "ios-browser"; // iPhone はホーム画面に追加したときだけ通知が届く
+  if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) return "unsupported";
+  if (Notification.permission === "denied") return "denied";
+  return Notification.permission === "granted" && lsGet(TOKEN_KEY) ? "on" : "ask";
+}
+let messaging = null;
+function getMessagingMod() {
+  if (!messaging) messaging = import(`${SDK}/firebase-messaging.js`)
+    .then(async m => ((await m.isSupported()) ? { m, inst: m.getMessaging(fbApp) } : null))
+    .catch(e => { console.warn(e); messaging = null; return null; });
+  return messaging;
+}
+// この端末の登録の、最後にやってみた結果（スマホの「🔔 通知」画面に出す）。{ ok, msg, detail, at }
+const PUSH_STATUS_KEY = "taiyo_push_status";
+const pushStatus = () => { try { return JSON.parse(lsGet(PUSH_STATUS_KEY) || "null"); } catch (e) { return null; } };
+function setPushStatus(ok, msg, detail = "") {
+  lsSet(PUSH_STATUS_KEY, JSON.stringify({ ok, msg, detail: String(detail).slice(0, 160), at: Date.now() }));
+  if (ui.view === "phone" && ui.screen.name === "notify") render();
+}
+// 待つ長さの上限（電波が弱いと返事が来ないまま止まることがあるので、打ち切って理由を出す）
+const inTime = (p, ms) => Promise.race([p, new Promise((_, ng) => setTimeout(() => ng(Object.assign(new Error("timeout"), { code: "timeout" })), ms))]);
+// どの段階で失敗したか（sw：通知の受け口、token：登録番号、save：サーバーへの保存）
+const pushStep = (step, p, ms) => inTime(p, ms).catch(e => { throw Object.assign(new Error((e && e.message) || String(e)), { step, code: (e && (e.code || e.name)) || "" }); });
+function pushErrText(e) {
+  const c = String(e.code || "") + " " + String(e.message || "");
+  if (/timeout/.test(c)) return "返事がありませんでした（電波が弱いかもしれません）";
+  if (/permission-blocked|permission-default|NotAllowedError/.test(c)) return "この端末で通知が許可されていません（端末の設定で許可してください）";
+  if (/VersionError/.test(c)) return "端末の中の保存場所の版が合いません（同じ住所のほかのアプリと Firebase の版がちがう）";
+  if (/unsupported/.test(c)) return "このブラウザでは通知を使えません";
+  if (e.step === "sw") return "通知の受け口（service worker）を用意できませんでした";
+  if (e.step === "token") return "通知の登録番号を取れませんでした";
+  if (e.step === "save") return "サーバーに登録を保存できませんでした（電波が弱いかもしれません）";
+  return "通知の登録に失敗しました";
+}
+// この端末の通知トークンを取り、名前とひもづけて保存する（前のトークンは片づける）
+// fresh：端末の中に残っている古い登録を捨てて、新しく取り直す（通知の受け口を一度外すと、Firebase が新しい登録番号を作り直す）
+async function saveToken(fresh = false) {
+  const ms = await getMessagingMod();
+  if (!ms) { setPushStatus(false, "このブラウザでは通知を使えません"); return false; }
+  if (!ME) return false;
+  try {
+    await pushStep("sw", navigator.serviceWorker.register("./sw.js"), 20000);
+    const reg = await pushStep("sw", navigator.serviceWorker.ready, 20000); // 動き出してからでないとトークンを取れない
+    if (fresh) { try { const sub = await reg.pushManager.getSubscription(); if (sub) await sub.unsubscribe(); } catch (e) { console.warn(e); } }
+    const token = await pushStep("token", ms.m.getToken(ms.inst, { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg }), 30000);
+    if (!token) throw Object.assign(new Error("空でした"), { step: "token" });
+    const old = lsGet(TOKEN_KEY);
+    await pushStep("save", setDoc(doc(db, "pushTokens", token), { name: ME, platform: isIOS ? "ios" : (/Android/.test(navigator.userAgent) ? "android" : "pc"), updatedAt: serverTimestamp() }), 20000);
+    if (old && old !== token) deleteDoc(doc(db, "pushTokens", old)).catch(() => {});
+    lsSet(TOKEN_KEY, token);
+    setPushStatus(true, fresh ? "無効になっていた登録を捨てて、新しく登録し直しました" : "この端末は通知を受け取れる状態です");
+    return true;
+  } catch (e) {
+    console.warn("通知の登録に失敗", e);
+    setPushStatus(false, pushErrText(e), [e.step, e.code, e.message].filter(Boolean).join(" / "));
+    return false;
+  }
+}
+// アプリを開いたとき：この端末の登録がサーバーで消されていたら（送ったときに無効と分かると、サーバーが消す）、古い登録を捨てて取り直す
+async function checkMyPush() {
+  const t = lsGet(TOKEN_KEY);
+  let gone = false;
+  if (t) { try { gone = !(await inTime(getDocFromServer(doc(db, "pushTokens", t)), 15000)).exists(); } catch (e) { /* 確かめられないときは、いつも通り保存し直すだけ */ } }
+  await saveToken(gone);
+}
+// 「テスト通知を送る」：押した本人のこの端末にだけ届く。無効になっていたら、取り直してもう一度送る
+// しくみ：pushTests に「この端末に送って」を1件書く → サーバー（Cloud Functions）が送って、結果（result）を同じ記録に書き戻す
+//        （会社の決まりで、だれでも呼べるサーバーの入口は作れないため、修理依頼の通知と同じ形にしている）
+let testBusy = false;
+function requestTestPush() {
+  const ref = doc(collection(db, "pushTests"));
+  return new Promise((ok, ng) => {
+    let unsub = () => {};
+    const timer = setTimeout(() => { unsub(); ng(Object.assign(new Error("timeout"), { code: "timeout" })); }, 30000);
+    setDoc(ref, { token: lsGet(TOKEN_KEY), name: ME, at: serverTimestamp() }).catch(e => { clearTimeout(timer); unsub(); ng(e); });
+    unsub = onSnapshot(ref, s => {
+      const r = s.exists() && s.get("result");
+      if (r) { clearTimeout(timer); unsub(); ok(r); }
+    }, e => { clearTimeout(timer); ng(e); });
+  });
+}
+async function sendTestPush() {
+  if (testBusy) return;
+  testBusy = true; render();
+  const call = () => requestTestPush();
+  try {
+    let r = await call(), again = false;
+    if (!r.ok && (r.code === "dead" || r.code === "not-registered")) { // サーバーで無効・未登録 → 取り直して、もう一度
+      again = true;
+      if (await saveToken(true)) r = await call();
+    }
+    if (r.ok) setPushStatus(true, `テスト通知を送りました${again ? "（登録を取り直してから）" : ""}。数秒たっても届かなければ、端末の設定で「社用車」の通知が許可されているか見てください`);
+    else if (r.code === "too-soon") setPushStatus(false, "少し前に送ったばかりです。30秒ほど待ってから押してください");
+    else if (!again || pushStatus().ok) setPushStatus(false, "テスト通知を送れませんでした", r.code || "");
+  } catch (e) {
+    console.warn(e);
+    setPushStatus(false, e.code === "timeout" ? "サーバーから返事がありませんでした（電波が弱いか、サーバーの更新待ち）" : "テスト通知を送れませんでした", e.code || e.message);
+  }
+  testBusy = false; render();
+}
+// 「🔔 通知をオンにする」：許可のダイアログを出す（iPhone では押した直後に呼ぶ必要がある）
+function enablePush() {
+  const ask = Notification.permission === "granted" ? Promise.resolve("granted") : Notification.requestPermission();
+  ask.then(async p => {
+    if (p !== "granted") { setPushStatus(false, "通知が許可されませんでした"); toast("通知は許可されませんでした"); render(); return; }
+    const ok = await saveToken();
+    toast(ok ? "通知をオンにしました" : `通知をオンにできませんでした：${pushStatus().msg}`, ok ? "" : "err");
+    render();
+  });
+}
+// 本人のオン・オフ（スマホの「🔔 通知」画面）
+function setMyPref(type, on) {
+  const off = new Set(myOff()); on ? off.delete(type) : off.add(type); S.prefs.set(ME, off); // すぐ画面に出す
+  setDoc(doc(db, "notifyPrefs", prefId(ME)), { name: ME, off: on ? arrayRemove(type) : arrayUnion(type), updatedAt: serverTimestamp() }, { merge: true })
+    .catch(e => { console.error(e); toast("変更できませんでした。もう一度お試しください", "err"); });
+}
+// 車両一覧のいちばん上：PC でオンにされているのに、この端末でまだ許可していない人に出す
+function pushBar() {
+  if (!S.notifyLoaded || !adminOn(ME).some(t => !myOff().has(t))) return "";
+  const st = pushState();
+  if (st === "ask") return `<button class="pushbtn" data-act="pushOn">🔔 通知をオンにする</button>`;
+  if (st === "ios-browser") return `<p class="pushnote">ホーム画面に追加すると通知が届きます</p>`;
+  return "";
+}
+// この端末の登録の状態（OK・失敗とその理由）と「テスト通知を送る」
+function pushStatusBox(st) {
+  const ps = pushStatus();
+  const when = ps ? (() => { const d = new Date(ps.at); return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours()}:${pad(d.getMinutes())}`; })() : "";
+  const there = lsGet(TOKEN_KEY) && S.tokenIds.has(lsGet(TOKEN_KEY));
+  const box = ps ? `<div class="pstatus ${ps.ok ? "ok" : "ng"}"><b>${ps.ok ? "✓" : "⚠"} ${esc(ps.msg)}</b>
+      <small>${when}${ps.ok && st === "on" ? `　サーバーの登録：${there ? "あり" : "確認中"}` : ""}${ps.detail ? `<br>くわしく：${esc(ps.detail)}` : ""}</small></div>` : "";
+  const test = st === "on" ? `<button class="btn ghost ptest" data-act="pushTest"${testBusy ? " disabled" : ""}>${testBusy ? "送っています…" : "テスト通知を送る（この端末にだけ届きます）"}</button>` : "";
+  return box + test;
+}
+function notifyScreen() {
+  const types = NTYPES.filter(t => adminOn(ME).includes(t[0]));
+  if (!S.notifyLoaded) return `<div class="loading">読み込み中…</div>`;
+  const st = pushState(), off = myOff();
+  const top = st === "ask" ? `<button class="pushbtn" data-act="pushOn">🔔 通知をオンにする</button>`
+    : st === "ios-browser" ? `<p class="pushnote">ホーム画面に追加すると通知が届きます</p>`
+    : st === "denied" ? `<p class="pushnote">この端末では通知が止められています。端末の設定で許可してください</p>`
+    : st === "unsupported" ? `<p class="pushnote">この端末では通知を使えません</p>` : "";
+  if (!types.length) return top + pushStatusBox(st) + `<div class="empty">届く通知はありません</div>`;
+  return top + pushStatusBox(st) + `<div class="nsw">${types.map(([k, , , label]) => `
+    <label class="nsw-row"><span>${label}</span><input type="checkbox" role="switch" class="switch-in" data-pref="${k}"${off.has(k) ? "" : " checked"}></label>`).join("")}</div>`;
+}
+
+/* ---------- 返却 ---------- */
+function returnForm(v) {
+  return `<div class="sheet-title">どこに止めましたか？</div><p class="sub">${esc(v.kind)}　${esc(v.plateKana)} ${esc(v.plateNum)}</p>
+  <div class="opts${(S.settings.lots || []).length > 3 ? " compact" : ""}">${(S.settings.lots || []).filter(Boolean).slice(0, LOT_MAX).map(l => `<button class="opt" data-act="return" data-id="${v.id}" data-val="${esc(l)}" data-rid="${esc(ui.screen.rid || "")}">${esc(l)}<span>›</span></button>`).join("")}</div>`;
+}
+function doReturn(v, lot, rid) {
+  const use = rid ? S.reservations.find(r => r.id === rid && !r.returnedAt) : currentUse(v);
+  if (!use) { toast("この車はもう返却されています"); go({ name: "detail", id: v.id }); return; }
+  // 押した瞬間に返却完了（電波が悪くても、つながったときに送られる）
+  const b = writeBatch(db);
+  b.update(doc(db, "reservations", use.id), { returnedAt: serverTimestamp(), returnedLot: lot });
+  b.update(doc(db, "vehicles", v.id), { currentLot: lot, updatedAt: serverTimestamp() });
+  b.commit().catch(e => { console.error(e); toast("返却を記録できませんでした。もう一度お試しください"); });
+  go({ name: "done", title: "返却しました", msg: `${lot} に置いてある、と記録しました` });
+}
+
+/* ---------- 修理依頼 ---------- */
+const SYMPTOMS = ["エンジン警告灯", "異音がする", "タイヤ", "ブレーキ", "エアコン", "傷・へこみ", "その他"];
+const REPAIR_TAG = { open: ["", "未対応"], in_repair: ["inrep", "修理中"], done: ["done", "対応済み"] };
+const MAX_REPAIR_PHOTOS = 10;
+const openCount = () => S.repairs.filter(r => r.status === "open").length;
+const repairDate = r => { const d = r.createdAt && r.createdAt.toDate ? r.createdAt.toDate() : new Date(); return `${d.getMonth() + 1}/${d.getDate()}`; };
+const repairKind = r => { const v = byId(r.vehicleId); return v ? esc(v.kind) : "（削除された車）"; };
+// 未対応・修理中を上に、それぞれ新しい順
+const sortedRepairs = list => [...list].sort((a, b) => ((a.status === "done") - (b.status === "done")) || (millis(b.createdAt) - millis(a.createdAt)));
+
+function listRepairs() {
+  if (!S.ready) return `<div class="loading">読み込み中…</div>`;
+  if (!S.repairs.length) return `<div class="empty">修理依頼はありません</div>`;
+  return sortedRepairs(S.repairs).map(r => {
+    const [cls, label] = REPAIR_TAG[r.status] || REPAIR_TAG.open;
+    const v = byId(r.vehicleId), tap = v && !v.retired && !v.hidden; // 押すとその車の詳細へ
+    return `
+  <div class="li${tap ? " tap" : ""}"${tap ? ` data-act="detail" data-id="${v.id}" role="button" tabindex="0"` : ""}><div class="grow"><div class="t">${esc(repairText(r))}</div><div class="s">${repairKind(r)}　${repairDate(r)}　${esc(r.reportedBy || "")}</div></div>
+    <span class="tag ${cls}">${label}</span></div>`;
+  }).join("");
+}
+
+// 「修理を頼む」の入力中の内容
+const rform = { vid: null, sym: new Set(), memo: "", avail: "", photos: [], err: "", busy: false, pct: 0 };
+function resetRform(vid) {
+  rform.photos.forEach(p => URL.revokeObjectURL(p.url));
+  Object.assign(rform, { vid, sym: new Set(), memo: "", avail: "", photos: [], err: "", busy: false, pct: 0 });
+}
+function repairForm(v) {
+  if (rform.vid !== v.id) resetRform(v.id);
+  return `<div class="sheet-title">${esc(v.kind)}</div><p class="sub">${plateText(v)}</p>
+  <div class="field"><label>どこが悪い？（複数OK）</label><div class="sympt">${SYMPTOMS.map(x => `<button class="chip ${rform.sym.has(x) ? "on" : ""}" data-act="sym" data-val="${x}">${x}</button>`).join("")}</div></div>
+  <div class="field"><label for="r-memo">くわしく（任意）</label><textarea id="r-memo" name="memo" rows="3" maxlength="2000" placeholder="例：右に曲がるときにゴトゴト鳴る">${esc(rform.memo)}</textarea></div>
+  <div class="field"><label for="r-avail">預けられる日（任意）</label><input type="date" id="r-avail" name="avail" min="${ymd(today())}" value="${esc(rform.avail)}"></div>
+  <div class="field">${rform.photos.length < MAX_REPAIR_PHOTOS
+    ? `<label class="photo-box">📷 写真をつける${rform.photos.length ? `（${rform.photos.length}枚）` : ""}<input type="file" id="r-photo" accept="image/*,.heic,.heif" multiple hidden></label>` : ""}
+    ${rform.photos.length ? `<div class="rphotos">${rform.photos.map((p, i) => `<div class="rphoto"><img src="${p.url}" alt=""><button class="rm" data-act="rmPhoto" data-val="${i}" aria-label="この写真をはずす">×</button></div>`).join("")}</div>` : ""}</div>
+  ${rform.err ? `<p class="ferr">${esc(rform.err)}</p>` : ""}
+  <div class="actions"><button class="btn primary big" data-act="sendRepair" data-id="${v.id}"${rform.busy ? " disabled" : ""}>${rform.busy ? (rform.photos.length ? `写真を送っています… ${rform.pct}%` : "送っています…") : "修理を頼む"}</button></div>`;
+}
+function toggleSym(x) { if (rform.busy) return; rform.sym.has(x) ? rform.sym.delete(x) : rform.sym.add(x); rform.err = ""; render(); }
+function addRepairPhotos(files) {
+  for (const f of files || []) {
+    if (rform.photos.length >= MAX_REPAIR_PHOTOS) { toast(`写真は${MAX_REPAIR_PHOTOS}枚までです`); break; }
+    if (f.type && !f.type.startsWith("image/")) continue;
+    rform.photos.push({ file: f, url: URL.createObjectURL(f) });
+  }
+  render();
+}
+function removeRepairPhoto(i) {
+  if (rform.busy) return;
+  const p = rform.photos.splice(i, 1)[0]; if (p) URL.revokeObjectURL(p.url);
+  render();
+}
+
+async function doRepair(v) {
+  if (rform.busy) return;
+  const memo = rform.memo.trim();
+  if (!rform.sym.size && !memo) { rform.err = "どこが悪いか選んでください"; render(); return; }
+  rform.err = ""; rform.busy = true; rform.pct = 0; render();
+  const ref = doc(collection(db, "repairs"));
+  let photos = [];
+  try {
+    if (rform.photos.length) {
+      photos = await uploadRepairPhotos(ref.id, rform.photos.map(p => p.file), pct => {
+        rform.pct = pct;
+        const b = document.querySelector('[data-act="sendRepair"]'); if (b) b.textContent = `写真を送っています… ${pct}%`;
+      });
+    }
+  } catch (e) {
+    console.error(e);
+    rform.busy = false; rform.err = "写真を送れませんでした。電波のよい所でもう一度押してください";
+    if (ui.screen.name === "repair") render();
+    return;
+  }
+  // 頼んだ人は自分の名前。出しただけでは「修理中」にしない（事務所が決める）
+  setDoc(ref, {
+    vehicleId: v.id, symptoms: SYMPTOMS.filter(x => rform.sym.has(x)), memo,
+    photoUrls: photos.map(p => p.photoUrl), photos, reportedBy: ME, status: "open", availDate: rform.avail || null, // 預けられる日（整備工場の画面に出る）
+    createdAt: serverTimestamp(), doneAt: null,
+  }).catch(e => { console.error(e); toast("修理依頼を送れませんでした。もう一度お試しください"); });
+  resetRform(null);
+  go({ name: "done", title: "修理を頼みました", msg: "事務所に届きました" });
+}
+
+// PC: 修理依頼の処理
+function setRepairStatus(id, st) {
+  const r = S.repairs.find(x => x.id === id); if (!r) return;
+  const data = { status: st, updatedAt: serverTimestamp() };
+  // 修理中にする前の状態を残す（間違えたときに「修理中を取り消す」で戻す）
+  if (st === "in_repair") { data.inRepairAt = serverTimestamp(); data.prev = { status: r.status, currentLot: (byId(r.vehicleId) || {}).currentLot || null }; }
+  if (st === "done") data.doneAt = serverTimestamp();
+  updateDoc(doc(db, "repairs", id), data).catch(e => { console.error(e); toast("変更できませんでした。もう一度お試しください"); });
+  toast(st === "in_repair" ? "修理中にしました" : (r.status === "in_repair" ? "修理完了にしました" : "対応済みにしました"));
+}
+
+function doneScreen(sc) {
+  const v = sc.check && checkOn() ? byId(sc.check) : null;
+  const ask = v ? `<div class="ck-ask"><b>🔍 乗る前の点検をお願いします</b><span>${esc(v.kind)}</span><button class="btn primary" data-act="ckStart" data-id="${v.id}">点検する</button></div>` : "";
+  return `<div class="done"><div class="ok">✓</div><h2>${esc(sc.title)}</h2><p>${esc(sc.msg)}</p>${ask}
+  ${ui.tab === "aki" ? `<button class="btn ${v ? "ghost" : "primary"}" data-act="tab" data-val="aki">${v ? "あとで（空き表へ戻る）" : "空き表へ戻る"}</button>` : `<button class="btn ${v ? "ghost" : "primary"}" data-act="tab" data-val="cars">${v ? "あとで（車両一覧へ戻る）" : "車両一覧へ戻る"}</button>`}</div>`;
+}
+
+/* ================= PC版ダッシュボード ================= */
+/* ---------- PC の表示の状態（絞り込み・グループの開閉・パネルの開閉。開き直しても覚えておく） ---------- */
+const pcUi = (() => {
+  const def = { page: "dash", filter: "all", type: "all", groups: { use: true, free: false, own: false, fix: true, insp: true }, panels: { shaken: false, repair: false, future: false } };
+  let p = {}; try { p = JSON.parse(lsGet("taiyo_pc_ui") || "{}") || {}; } catch (e) { p = {}; }
+  return { page: ["aki", "check"].includes(p.page) ? p.page : def.page, filter: p.filter || def.filter, type: p.type || def.type, groups: { ...def.groups, ...(p.groups || {}) }, panels: { ...def.panels, ...(p.panels || {}) } };
+})();
+const savePcUi = () => lsSet("taiyo_pc_ui", JSON.stringify(pcUi));
+const PC_FILTERS = [["all", "全部"], ["free", "空き"], ["use", "使用中"], ["fix", "修理中"], ["insp", "車検中"], ["own", "専用"]];
+const PANEL_LIMIT = 3;
+// パネルの中身を3件まで出し、残りは「＋ ほか○台を表示」で開く
+function foldList(key, items, unit) {
+  const open = !!pcUi.panels[key], hidden = items.length - PANEL_LIMIT;
+  return {
+    shown: open ? items : items.slice(0, PANEL_LIMIT),
+    more: hidden > 0 ? `<button class="more" data-act="pcPanel" data-val="${key}" aria-expanded="${open}">${open ? `− ${PANEL_LIMIT}${unit}だけ表示` : `＋ ほか${hidden}${unit}を表示`}</button>` : "",
+  };
+}
+
+// PC のいちばん上のタブ（今日の状況・空き表・点検表）。点検表は、設定でオンにしたときだけ
+const pcTabs = () => `<div class="pctabs" role="tablist">${[["dash", "🚐 今日の状況"], ["aki", "📅 空き表"], ...(checkOn() ? [["check", "📋 点検表"]] : [])].map(([k, l]) =>
+  `<button type="button" role="tab" class="${pcUi.page === k ? "on" : ""}" data-act="pcPage" data-val="${k}" aria-selected="${pcUi.page === k}">${l}</button>`).join("")}</div>`;
+function renderPc() {
+  const vs = shown(), d = today();
+  if (pcUi.page === "check" && !checkOn()) pcUi.page = "dash"; // 点検表をオフにしたら、今日の状況へ
+  $("pc").classList.toggle("pc-check", pcUi.page === "check"); // 点検表のときだけ、画面の幅いっぱいに
+  if (pcUi.page === "check") {
+    $("pc").classList.remove("pc-aki"); $("switch").hidden = !wide.matches;
+    const sc = $("pc").querySelector(".cks-scroll"), left = sc ? sc.scrollLeft : 0; // 横にずらした位置は、描き直してもそのまま
+    $("pc").innerHTML = pcTabs() + errBar() + checkPage();
+    const sc2 = $("pc").querySelector(".cks-scroll"); if (sc2) sc2.scrollLeft = left;
+    return;
+  }
+  // 空き表のときは左右の余白をなくして、表を画面の幅いっぱいに
+  $("pc").classList.toggle("pc-aki", pcUi.page === "aki");
+  // 空き表のときは、上の「スマホ版／PC版ダッシュボード」を、タブの行の右はしに小さく置く
+  $("switch").hidden = !wide.matches || pcUi.page === "aki";
+  if (pcUi.page === "aki") {
+    const sw = `<div class="sw-mini" role="group" aria-label="表示の切り替え"><button data-act="view" data-val="phone">スマホ版</button><button class="on" data-act="view" data-val="pc">PC版ダッシュボード</button></div>`;
+    $("pc").innerHTML = `<div class="aki-head"><div class="a-top">${pcTabs()}${sw}</div>${errBar()}</div>${akiHtml(true)}`;
+    fitAki();
+    return;
+  }
+  const n = k => vs.filter(v => groupOf(v) === k).length;
+  const retired = S.vehicles.filter(v => v.retired);
+  const hiddenV = active().filter(v => v.hidden);
+  const hasSample = S.vehicles.some(v => v.sample);
+
+  let table;
+  if (!S.ready) table = `<div class="loading">読み込み中…</div>`;
+  else if (!vs.length) table = `<div class="empty">まだ車が登録されていません。「＋ 車両を追加」から登録してください${
+    !S.vehicles.length ? `<div style="margin-top:12px"><button class="btn ghost small" data-act="seed">サンプルデータ（車12台・名簿8人）を入れて試す</button></div>` : ""}</div>`;
+  else {
+    const typeOK = v => pcUi.type === "all" || v.type === pcUi.type;
+    const stOK = v => (["fix", "insp"].includes(pcUi.filter) ? status(v) === pcUi.filter : matchFilter(v, pcUi.filter));
+    const byType = vs.filter(typeOK), list = byType.filter(stOK);
+    const n1 = k => byType.filter(v => (["fix", "insp"].includes(k) ? status(v) === k : matchFilter(v, k))).length;
+    const n2 = t => vs.filter(v => (t === "all" || v.type === t) && stOK(v)).length;
+    const tabs = `<div class="pcfilter"><div class="chips six">${PC_FILTERS.map(([k, l]) =>
+      `<button class="chip ${pcUi.filter === k ? "on" : ""}" data-act="pcFilter" data-val="${k}">${l}<span class="n">${n1(k)}</span></button>`).join("")}</div>
+      <div class="chips types four">${[["all", "全種類"], ...TYPES.map(t => [t, t])].map(([k, l]) =>
+      `<button class="chip ${pcUi.type === k ? "on" : ""}" data-act="pcType" data-val="${k}">${l}<span class="n">${n2(k)}</span></button>`).join("")}</div></div>`;
+    table = tabs + (!list.length ? `<div class="empty">この条件の車はありません</div>` : `<table class="table"><thead><tr><th>状態</th><th>写真</th><th>ナンバー</th><th>車種</th><th>使っている人</th><th>現場</th><th>置き場所</th><th>車検</th></tr></thead><tbody>
+      ${["use", "free", "own", "fix", "insp"].map(g => {
+        const rows = list.filter(v => groupOf(v) === g); if (!rows.length) return "";
+        const open = !!pcUi.groups[g];
+        return `<tr class="grp ${g}${open ? "" : " closed"}" data-act="pcGroup" data-val="${g}" tabindex="0" role="button" aria-expanded="${open}" title="押すと${open ? "閉じます" : "開きます"}"><td colspan="8"><span class="caret">${open ? "▼" : "▶"}</span>${LABEL[g]}<span>${rows.length}台</span>${g === "use" && rows.some(v => isOverdue(currentUse(v))) ? `<span class="tag overdue">うち返却待ち ${rows.filter(v => isOverdue(currentUse(v))).length}台</span>` : ""}</td></tr>` + (!open ? "" : rows.map(v => {
+          const insp = g === "insp", use = insp ? null : currentUse(v), over = isOverdue(use);
+          return `<tr class="vrow ${g}${over ? " over" : ""}" data-act="edit" data-id="${v.id}" title="押すと修正できます">
+        <td class="st"><span class="dot ${g}"></span>${LABEL[g]}${over ? '<div><span class="tag overdue">返却待ち</span></div>' : ""}</td>
+        <td>${thumbHtml(v, false, true)}</td><td>${plateHtml(v, true)}</td><td class="kind">${esc(v.kind)}${vehicleTags(v)}</td>
+        <td>${use ? esc(use.who) : "—"}</td><td>${use ? `${esc(use.site)}<div class="s${over ? " overdue-s" : ""}" style="font-size:12px">${fmt(use.from)}〜${fmt(use.to)}${over ? "（返却予定を過ぎています）" : ""}</div>` : insp ? `車検<div class="s" style="font-size:12px">${inspText(v.inspection)}</div>` : (g === "fix" && fixRepair(v) && fixRepair(v).shop ? `<div class="s" style="font-size:12px">${shopText(fixRepair(v))}</div>` : "—")}</td>
+        <td>${use || insp ? "—" : esc(lotOf(v))}</td><td>${shakenDays(v, ' style="font-size:13px"')}</td></tr>`;
+        }).join(""));
+      }).join("")}
+      </tbody></table>`);
+  }
+
+  $("pc").innerHTML = pcTabs() + `
+  <div class="top"><h1>社用車 今日の状況</h1><span class="today">${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日（${DOW[d.getDay()]}）</span>
+    <div class="counts"><div class="count free">${n("free")}<span>空き</span></div><div class="count use">${n("use")}<span>使用中</span></div><div class="count fix">${n("fix")}<span>修理中</span></div><div class="count insp">${n("insp")}<span>車検中</span></div></div>
+    <button class="btn ghost small" data-act="settings">⚙ 設定</button></div>
+  ${errBar()}
+  <div class="grid2">
+    <div class="stack">
+      ${shakenPanel()}
+      ${repairPanel()}
+      ${futurePanel()}
+    </div>
+    ${checkPanel()}
+    <div class="panel wide"><h2>全車両 <button class="btn primary small" data-act="add">＋ 車両を追加</button></h2>${table}</div>
+    ${hiddenV.length ? `<details class="panel retired hiddenv"${ui.hiddenOpen ? " open" : ""}><summary>非表示中（${hiddenV.length}台）</summary>
+      <table class="table"><tbody>${hiddenV.map(v => `<tr>
+        <td>${thumbHtml(v)}</td><td>${plateHtml(v, true)}</td><td class="kind">${esc(v.kind)}${vehicleTags(v)}</td><td>${esc(v.type)}</td>
+        <td style="text-align:right"><button class="btn ghost small" data-act="unhide" data-id="${v.id}">表示に戻す</button></td></tr>`).join("")}</tbody></table>
+    </details>` : ""}
+    ${retired.length ? `<details class="panel retired"${ui.retiredOpen ? " open" : ""}><summary>廃車済み（${retired.length}台）</summary>
+      <table class="table"><tbody>${retired.map(v => `<tr>
+        <td>${thumbHtml(v)}</td><td>${plateHtml(v, true)}</td><td class="kind">${esc(v.kind)}</td><td>${esc(v.type)}</td>
+        <td style="text-align:right"><button class="btn ghost small" data-act="restore" data-id="${v.id}">戻す</button></td></tr>`).join("")}</tbody></table>
+    </details>` : ""}
+  </div>
+  ${hasSample ? `<p class="sample-note">サンプルデータが入っています。本番の車を登録する前に <button class="linkbtn" data-act="unseed">サンプルデータを消す</button></p>` : ""}`;
+}
+
+/* ---------- 写真（ブラウザで縮小してから Storage へ送る） ---------- */
+const PHOTO_MAX = 1280, THUMB_MAX = 480;
+
+// 画像を読み込む（スマホで縦に撮った写真の向きも正しく直す）
+async function decodeImage(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file, { imageOrientation: "from-image" }); } catch (e) { /* 下の方法で読む */ }
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    return await new Promise((ok, ng) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => ng(new Error("画像を読めません")); i.src = url; });
+  } finally { URL.revokeObjectURL(url); }
+}
+// iPhone の HEIC 写真は、パソコンの Chrome / Edge では読めない。そのときだけ変換の部品（heic-to。新しい iPhone の HEIC にも対応）を読み込んで JPEG にする
+const HEIC_LIB_URL = "https://cdn.jsdelivr.net/npm/heic-to@1.5.2/dist/iife/heic-to.js";
+const isHeic = f => /image\/hei[cf]/i.test(f.type || "") || /\.(heic|heif)$/i.test(f.name || "");
+let heicLib = null;
+function loadHeicLib() {
+  if (!heicLib) heicLib = new Promise((ok, ng) => {
+    if (window.HeicTo) return ok(window.HeicTo);
+    const sc = document.createElement("script"); sc.src = HEIC_LIB_URL; sc.async = true;
+    sc.onload = () => (window.HeicTo ? ok(window.HeicTo) : ng(new Error("heic-lib")));
+    sc.onerror = () => { heicLib = null; ng(new Error("heic-lib")); };
+    document.head.appendChild(sc);
+  });
+  return heicLib;
+}
+// 写真を読み込む。読めない形式なら Error("bad-image")、HEIC の変換部品が読めなければ Error("heic-lib")
+async function readPhoto(file) {
+  if (file.type && !file.type.startsWith("image/") && !isHeic(file)) throw new Error("bad-image");
+  try { return await decodeImage(file); } catch (e) { if (!isHeic(file)) throw new Error("bad-image"); }
+  const HeicTo = await loadHeicLib();
+  let jpeg;
+  try { jpeg = await HeicTo({ blob: file, type: "image/jpeg", quality: 0.9 }); }
+  catch (e) { console.error(e); throw new Error("bad-image"); }
+  try { return await decodeImage(jpeg); } catch (e) { throw new Error("bad-image"); }
+}
+const photoErrMsg = e => (e && e.message === "bad-image" ? "この形式の写真は使えません。JPEGかPNGを選んでください"
+  : e && e.message === "heic-lib" ? "iPhoneの写真（HEIC）を変換できませんでした。電波のよい所でもう一度選ぶか、JPEGかPNGを選んでください"
+  : "写真を送れませんでした。電波のよい所でもう一度お試しください");
+
+// 長い辺が max px になるよう縮めて JPEG にする
+function toJpeg(img, max, quality) {
+  const w0 = img.naturalWidth || img.width, h0 = img.naturalHeight || img.height;
+  const k = Math.min(1, max / Math.max(w0, h0));
+  const c = document.createElement("canvas");
+  c.width = Math.round(w0 * k); c.height = Math.round(h0 * k);
+  const g = c.getContext("2d");
+  g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); // 透明な部分は白に
+  g.drawImage(img, 0, 0, c.width, c.height);
+  return new Promise((ok, ng) => c.toBlob(b => (b ? ok(b) : ng(new Error("画像を変換できません"))), "image/jpeg", quality));
+}
+function uploadBlob(path, blob, onBytes) {
+  return new Promise((ok, ng) => {
+    const task = uploadBytesResumable(storageRef(storage, path), blob, { contentType: "image/jpeg", cacheControl: "public,max-age=31536000" });
+    task.on("state_changed", s => onBytes(s.bytesTransferred), ng, () => getDownloadURL(task.snapshot.ref).then(ok, ng));
+  });
+}
+// 1枚の写真から「大（1280px）」と「一覧用の小（480px）」を作って送る。dir は "vehicles/{id}" など
+async function makePhotos(file, dir, onProgress) {
+  const img = await readPhoto(file);
+  let big, small;
+  try { big = await toJpeg(img, PHOTO_MAX, 0.85); small = await toJpeg(img, THUMB_MAX, 0.8); }
+  finally { if (img.close) img.close(); }
+  const name = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const photoPath = `${dir}/${name}.jpg`, thumbPath = `${dir}/${name}_s.jpg`;
+  const sent = [0, 0], total = big.size + small.size;
+  const report = () => onProgress && onProgress(Math.min(99, Math.round((sent[0] + sent[1]) / total * 100)));
+  const [photoUrl, thumbUrl] = await Promise.all([
+    uploadBlob(photoPath, big, n => { sent[0] = n; report(); }),
+    uploadBlob(thumbPath, small, n => { sent[1] = n; report(); }),
+  ]);
+  return { photoUrl, thumbUrl, photoPath, thumbPath };
+}
+
+// 車両の写真を登録・変更（スマホの車両詳細と、PCの車両の修正・追加から）
+const uploading = {}; // 車ID → 送信中の％
+function photoBtn(v) {
+  const pct = uploading[v.id];
+  if (pct != null) return `<span class="photo-btn busy" data-upl="${v.id}">📷 送っています… ${pct}%</span>`;
+  return `<label class="photo-btn">📷 ${v.photoUrl ? "写真を変える" : "写真を登録"}<input type="file" accept="image/*,.heic,.heif" hidden data-photo="${v.id}"></label>`;
+}
+async function setVehiclePhoto(vid, file) {
+  if (uploading[vid] != null) { toast("この車の写真を送っているところです"); return; }
+  const old = byId(vid) || {};
+  const oldPaths = [old.photoPath, old.thumbPath].filter(Boolean);
+  uploading[vid] = 0; refresh();
+  if (ui.view === "pc") toast("写真を送っています…");
+  try {
+    const p = await makePhotos(file, `vehicles/${vid}`, pct => {
+      uploading[vid] = pct;
+      document.querySelectorAll(`[data-upl="${vid}"]`).forEach(el => { el.textContent = `📷 送っています… ${pct}%`; });
+      if (ui.view === "pc") toast(`写真を送っています… ${pct}%`);
+    });
+    await updateDoc(doc(db, "vehicles", vid), { ...p, updatedAt: serverTimestamp() });
+    oldPaths.forEach(x => deleteObject(storageRef(storage, x)).catch(() => {})); // 前の写真は片づける
+    toast("写真を登録しました");
+  } catch (e) {
+    console.error(e);
+    toast(photoErrMsg(e), "err"); // 失敗したら赤いお知らせを長めに出す
+  } finally {
+    delete uploading[vid]; refresh();
+  }
+}
+
+// 修理依頼の写真（段階4の「修理を頼む」画面で使う）
+// 例: const photos = await uploadRepairPhotos(repairRef.id, files, pct => …);
+//     → [{ photoUrl, thumbUrl, photoPath, thumbPath }, …] を repairs/{id}.photos に保存する
+async function uploadRepairPhotos(repairId, files, onProgress) {
+  const list = [...files], out = [];
+  for (let i = 0; i < list.length; i++) {
+    out.push(await makePhotos(list[i], `repairs/${repairId}`, pct => onProgress && onProgress(Math.round((i + pct / 100) / list.length * 100))));
+  }
+  return out;
+}
+
+// PC: 車検が近い車（60日以内。通知日数を60日より長くしたときはその日数まで）
+// 車検で預けられる日（整備工場の画面に会社が決めた日の札と出る。入れると整備工場に通知）。車検中の車には出さない
+// 整備工場が希望日（取りに行きたい日）を入れていれば「整備工場の希望 10/15」と「この日でOK」（押すと預けられる日にその日が入る）
+const wishOf = v => (v.shopWish && v.shopWish.date && (!v.shopWish.shaken || v.shopWish.shaken === v.shakenDate) ? v.shopWish : null); // 前の車検のときの希望は使わない
+function wishHtml(v) {
+  const w = wishOf(v); if (!w) return "";
+  const ok = w.date === v.availDate, past = w.date < ymd(today());
+  return `<span class="hope${ok ? " ok" : ""}" title="${esc(w.by || SHOP_NAME)}が入れた希望日">${esc(SHOP_NAME)}の希望 ${fmt(w.date)}（${DOW[parse(w.date).getDay()]}）${ok ? " ✓" : past ? "（過ぎています）" : ""}</span>`
+    + (ok || past ? "" : `<button type="button" class="btn free small" data-act="wishOk" data-id="${v.id}">この日でOK</button>`);
+}
+const availInput = v => (v.inspection ? "" : `<div class="avail" data-act="avail">${wishHtml(v)}<label><span>預けられる日</span><input type="date" data-act="avail" data-avail="${v.id}" value="${esc(v.availDate || "")}" min="${ymd(today())}" aria-label="${esc(v.kind)} の預けられる日"></label></div>`);
+// 「この日でOK」：整備工場の希望日を、そのまま預けられる日にする
+function acceptWish(id) {
+  const v = byId(id), w = v && wishOf(v); if (!w || v.inspection) return;
+  updateDoc(doc(db, "vehicles", v.id), { availDate: w.date, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("保存できませんでした。もう一度お試しください", "err"); });
+  toast(`預けられる日を ${fmt(w.date)} にしました（${SHOP_NAME}に知らせます）`);
+}
+function setAvail(el) {
+  updateDoc(doc(db, "vehicles", el.dataset.avail), { availDate: el.value || null, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("保存できませんでした。もう一度お試しください", "err"); });
+  toast(el.value ? `預けられる日を ${fmt(el.value)} にしました` : "預けられる日を消しました");
+  el.blur();
+}
+function shakenPanel() {
+  const lim = Math.max(60, alertDays());
+  const soon = byShaken(shown().filter(v => daysTo(v.shakenDate) <= lim));
+  const f = foldList("shaken", soon, "台");
+  return `<div class="panel"><h2>車検が近い車 <span class="tag">${soon.length}台</span></h2>
+    ${soon.length ? f.shown.map(v => `<div class="li tap" data-act="edit" data-id="${v.id}" title="押すと車検満了日を変えられます">${plateHtml(v, true)}<div class="grow"><div class="t">${esc(v.kind)}</div><div class="s">${jp(v.shakenDate)}</div></div>${shakenDays(v)}${availInput(v)}</div>`).join("")
+      + f.more : `<div class="empty">${lim}日以内の車検はありません</div>`}
+  </div>`;
+}
+// PC: この先の予約（今日より後、日付順）
+function futurePanel() {
+  const t = ymd(today());
+  const list = S.reservations.filter(r => !r.returnedAt && r.from > t && byId(r.vehicleId) && !byId(r.vehicleId).retired && !byId(r.vehicleId).hidden)
+    .sort((a, b) => (a.from > b.from ? 1 : a.from < b.from ? -1 : 0));
+  const f = foldList("future", list, "件");
+  return `<div class="panel"><h2>この先の予約 <span class="tag plain">${list.length}件</span></h2>
+    ${f.shown.map(r => { const v = byId(r.vehicleId); return `<div class="li"><div class="days" style="background:var(--bg);color:var(--ink)">${rangeText(r)}</div><div class="grow"><div class="t">${esc(v.kind)}</div><div class="s">${esc(r.who)}さん　${esc(r.site)}</div></div><button class="btn ghost small" data-act="cancelRes" data-id="${r.id}">取り消す</button></div>`; }).join("") + f.more || `<div class="empty">予約はありません</div>`}
+  </div>`;
+}
+
+// PC: 修理依頼パネル（未対応と修理中。対応済みは出さない）
+function repairPanel() {
+  const list = sortedRepairs(S.repairs.filter(r => r.status !== "done" && !(byId(r.vehicleId) || {}).hidden))
+    .sort((a, b) => (a.status === "in_repair") - (b.status === "in_repair")); // 未対応を上に
+  const n = openCount(), f = foldList("repair", list, "件");
+  return `<div class="panel rpanel"><h2>修理依頼 <span class="tag">${n}件 未対応</span></h2>
+    ${list.length ? f.shown.map(r => {
+      const photos = r.photos || [];
+      const btns = r.status === "in_repair"
+        ? `<button class="btn free small" data-act="repairSet" data-id="${r.id}" data-val="done">修理完了（空きに戻す）</button>
+           <button class="btn ghost small" data-act="repairUndo" data-id="${r.id}">修理中を取り消す（間違えたとき）</button>`
+        : `<button class="btn ghost small" data-act="repairSet" data-id="${r.id}" data-val="done">対応済みにする</button>
+           <button class="btn danger small" data-act="repairSet" data-id="${r.id}" data-val="in_repair">修理中にする</button>`;
+      return `<div class="li"><div class="grow">
+          <div class="t">${r.status === "in_repair" ? '<span class="tag inrep">修理中</span> ' : ""}${esc(repairText(r))}</div>
+          <div class="s">${repairKind(r)}　${repairDate(r)}　${esc(r.reportedBy || "")}</div>
+          ${r.shop ? `<div class="s shopnote">${shopText(r)}</div>` : (r.availDate ? `<div class="s">預けられる日 ${fmt(r.availDate)}</div>` : "")}
+          ${photos.length ? `<div class="rthumbs">${photos.map(p => `<a href="${esc(p.photoUrl)}" target="_blank" rel="noopener" title="大きく見る"><img src="${esc(p.thumbUrl || p.photoUrl)}" alt="修理の写真" loading="lazy"></a>`).join("")}</div>` : ""}
+        </div><div class="rbtns">${btns}</div></div>`;
+    }).join("") + f.more : `<div class="empty">未対応の依頼はありません</div>`}
+  </div>`;
+}
+
+/* ---------- 車両の登録・修正（PCのみ） ---------- */
+let modalId = null; // null=追加, 文字列=修正中の車
+function openModal(id) {
+  const v = id ? byId(id) : null;
+  modalId = v ? v.id : null;
+  const lots = [...S.settings.lots];
+  [v && v.homeLot, v && v.currentLot].forEach(l => { if (l && !lots.includes(l)) lots.push(l); });
+  const val = k => esc(v ? v[k] : "");
+  $("modal").innerHTML = `<div class="overlay"><form class="modal panel" id="vform" novalidate>
+    <h2>${v ? "車両を修正" : "車両を追加"}<button type="button" class="x" data-act="close" aria-label="閉じる">×</button></h2>
+    <div class="mbody">
+      <div class="mhero">
+        <div id="f-prev">${formPhotoHtml(v && v.photoUrl, v)}</div>
+        ${v ? plateHtml(v) : ""}
+        <label class="photo-btn">📷 ${v && v.photoUrl ? "写真を変える" : "写真を登録"}<input type="file" accept="image/*,.heic,.heif" hidden id="f-photo"></label>
+      </div>
+      ${v ? undoBox(v) : ""}
+      <p class="ferr" id="ferr" hidden></p>
+      <div class="field"><label>ナンバー</label>
+        <div class="plate-in">
+          <input name="plateArea" value="${val("plateArea")}" placeholder="${esc(COMPANY.plateAreaExample || "品川")}" aria-label="地域" autocomplete="off">
+          <input name="plateClass" value="${val("plateClass")}" placeholder="300" aria-label="分類番号" inputmode="numeric" autocomplete="off">
+          <input name="plateKana" value="${val("plateKana")}" placeholder="あ" aria-label="ひらがな" maxlength="1" autocomplete="off">
+          <input name="plateNum" value="${val("plateNum")}" placeholder="12-34" aria-label="番号" autocomplete="off">
+        </div>
+        <div class="hint">地域・分類番号・ひらがな・番号（例：${esc(COMPANY.plateAreaExample || "品川")} 300 あ 12-34）</div></div>
+      <div class="field"><label for="f-kind">車種</label><input id="f-kind" name="kind" value="${val("kind")}" placeholder="例：ハイエース（バン）" autocomplete="off"></div>
+      <div class="field"><label>種類</label><div class="seg">${TYPES.map(t =>
+        `<label class="chip"><input type="radio" name="type" value="${t}"${v && v.type === t ? " checked" : ""}>${t}</label>`).join("")}</div></div>
+      <div class="field"><label for="f-shaken">車検満了日</label><input id="f-shaken" type="date" name="shakenDate" value="${val("shakenDate")}">
+        ${v ? `<div class="hint">車検を受けたら、新しい満了日に変えて保存してください</div>` : ""}</div>
+      <div class="field"><label for="f-lic">必要な免許</label><select id="f-lic" name="license">
+        ${LICENSES.map(l => `<option${(v ? licOf(v) : "普通") === l ? " selected" : ""}>${l}</option>`).join("")}</select></div>
+      <div class="field"><label for="f-owner">専用（任意）</label><select id="f-owner" name="owner">
+        <option value="">（なし：だれでも使える）</option>
+        ${MGROUPS.map(g => { const names = activeMembers().filter(m => mGroupOf(m) === g).map(m => m.name).sort(byLen);
+          return names.length ? `<optgroup label="${g}">${names.map(n => `<option${v && v.owner === n ? " selected" : ""}>${esc(n)}</option>`).join("")}</optgroup>` : ""; }).join("")}
+        ${v && v.owner && !activeMembers().some(m => m.name === v.owner) ? `<option selected>${esc(v.owner)}</option>` : ""}</select></div>
+      <div class="field"><label for="f-lot">置き場所</label><select id="f-lot" name="lot">
+        ${lots.map(l => `<option${(v ? lotOf(v) === l : l === lots[0]) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>
+      ${checkOn() ? `<fieldset class="ck-vset"><legend>点検表に出すこと</legend>
+        <div class="field"><label for="f-driver">いつも乗る人（点検表の運転者）</label><select id="f-driver" name="driver">
+          <option value="">（決まっていない）</option>
+          ${MGROUPS.map(g => { const names = activeMembers().filter(m => mGroupOf(m) === g).map(m => m.name).sort(byLen);
+            return names.length ? `<optgroup label="${g}">${names.map(n => `<option${v && v.driver === n ? " selected" : ""}>${esc(n)}</option>`).join("")}</optgroup>` : ""; }).join("")}
+          ${v && v.driver && !activeMembers().some(m => m.name === v.driver) ? `<option selected>${esc(v.driver)}</option>` : ""}</select></div>
+        <div class="field"><label>エアタンク</label><div class="seg">${[["0", "なし"], ["1", "あり"]].map(([k, l]) =>
+          `<label class="chip"><input type="radio" name="airTank" value="${k}"${(v && v.airTank ? "1" : "0") === k ? " checked" : ""}>${l}</label>`).join("")}</div>
+          <div class="hint">「あり」の車だけ、点検に${esc(checkItems().filter(x => x.air).map(x => x.name).join("・") || "エアタンクの項目")}が出ます</div></div>
+        <div class="ck-ym3">${[["oilAt", "前回のオイル交換"], ["tireAt", "前回のノーマルタイヤ交換"], ["studAt", "前回のスタッドレス交換"]].map(([k, l]) =>
+          `<div class="field"><label for="f-${k}">${l}</label><input type="month" id="f-${k}" name="${k}" value="${val(k)}" placeholder="2026-07" autocomplete="off"></div>`).join("")}</div>
+        <div class="hint">年と月だけ（わからなければ空でよい）</div></fieldset>` : ""}
+    </div>
+    <div class="mfoot">
+      ${v ? `<button type="button" class="btn danger" data-act="retire">廃車にする</button><button type="button" class="btn ghost" data-act="hideCar">${v.hidden ? "表示に戻す" : "一時的に隠す"}</button>
+        <button type="button" class="btn insp" data-act="${v.inspection ? "inspBack" : "inspOut"}" data-id="${v.id}">${v.inspection ? "車検から戻す" : "車検に出す"}</button>` : ""}
+      <span class="sp"></span>
+      <button type="button" class="btn ghost" data-act="close">やめる</button>
+      <button type="submit" class="btn primary">${v ? "保存する" : "登録する"}</button>
+    </div>
+  </form></div>`;
+  $("modal").hidden = false;
+  loadImages($("modal"));
+  $("vform").plateArea.focus();
+}
+// 車検中・修理中の車：間違えたとき用の取り消しボタン（車検から戻ったとき・修理が終わったときは使わない）
+function undoBox(v) {
+  const rs = repairsOf(v);
+  return (v.inspection ? `<div class="undo-box insp"><div class="grow"><b>車検中</b>　${inspText(v.inspection)}</div>
+      <button type="button" class="btn ghost small" data-act="inspUndo" data-id="${v.id}">車検を取り消す（間違えたとき）</button></div>` : "")
+    + (rs.length ? `<div class="undo-box fix"><div class="grow"><b>修理中</b>　${rs.map(r => esc(repairText(r) || "修理依頼") + (r.shop ? `（${shopText(r)}）` : "")).join("／")}</div>
+      <button type="button" class="btn ghost small" data-act="repairUndoCar" data-id="${v.id}">修理中を取り消す（間違えたとき）</button></div>` : "");
+}
+// フォームの上の大きい写真。url があれば押すと画面いっぱいに開く。なければ車のイラスト
+function formPhotoHtml(url, v) {
+  const first = v && v.thumbUrl && url === v.photoUrl ? v.thumbUrl : url; // 小さい写真をすぐ出して、大きい写真に差し替える
+  return url
+    ? `<div class="mhero-img zoomable" data-act="viewPhoto" data-val="${esc(url)}" role="button" tabindex="0" aria-label="写真を大きく見る"><img src="${esc(first)}"${first !== url ? ` data-full="${esc(url)}"` : ""} alt="" decoding="async"></div>`
+    : `<div class="mhero-img empty" aria-hidden="true">${carSvg(v ? carColor(v) : CAR_COLORS[0])}</div>`;
+}
+let pendingPhoto = null; // フォームで選んだ写真（保存するときに送る）
+function closeModal() {
+  $("modal").hidden = true; $("modal").innerHTML = ""; modalId = null; ui.pcRes = null;
+  if (pendingPhoto) URL.revokeObjectURL(pendingPhoto.preview);
+  pendingPhoto = null;
+}
+
+/* ---------- 設定（PCのみ） ---------- */
+const LOT_MAX = 5; // 駐車場は5ヶ所まで（空欄は使わない）
+// 設定の「現場リスト」「駐車場」の1行（名前の欄と × ）。駐車場は前の名前も持っておく（名前を変えたら車の置き場所も直すため）
+const itemRow = (kind, name) => `<div class="irow"><input name="${kind}" value="${esc(name)}" maxlength="${kind === "lot" ? 30 : 100}" autocomplete="off" aria-label="${kind === "lot" ? "駐車場" : "現場"}の名前">${kind === "lot" ? `<input type="hidden" name="lotOld" value="${esc(name)}">` : ""}<button type="button" class="x" data-act="itemDel" aria-label="消す">×</button></div>`;
+function itemAdd(kind) {
+  const inp = $(`${kind}-new`), box = $(`${kind}-list`), name = inp.value.trim();
+  const showErr = t => { const e = $("ferr"); e.textContent = t; e.hidden = false; e.scrollIntoView({ block: "nearest" }); };
+  if (!name) { inp.focus(); return; }
+  const have = [...box.querySelectorAll(`input[name="${kind}"]`)].map(x => x.value.trim());
+  if (have.includes(name)) return showErr(`「${name}」はもうあります`);
+  if (kind === "lot" && have.filter(Boolean).length >= LOT_MAX) return showErr(`駐車場は${LOT_MAX}ヶ所までです`);
+  box.insertAdjacentHTML("beforeend", itemRow(kind, name).replace(/<input type="hidden" name="lotOld" value="[^"]*">/, `<input type="hidden" name="lotOld" value="">`));
+  inp.value = ""; $("ferr").hidden = true;
+  if (kind === "lot") $("lot-add").hidden = have.filter(Boolean).length + 1 >= LOT_MAX;
+  box.scrollTop = box.scrollHeight; inp.focus();
+}
+function itemDel(btn) {
+  const row = btn.closest(".irow"), lot = !!row.querySelector('input[name="lot"]');
+  row.remove();
+  if (lot) $("lot-add").hidden = $("lot-list").querySelectorAll('input[name="lot"]').length >= LOT_MAX;
+}
+function openSettings() {
+  const st = S.settings;
+  const lots = [...(st.lots || [])].slice(0, LOT_MAX); while (lots.length < LOT_MAX) lots.push("");
+  modalId = null;
+  $("modal").innerHTML = `<div class="overlay"><form class="modal panel" id="sform" novalidate>
+    <h2>設定<button type="button" class="x" data-act="close" aria-label="閉じる">×</button></h2>
+    <div class="stabs" role="tablist">${[["basic", "基本"], ["notify", "通知"], ["check", "点検"]].map(([k, l]) =>
+      `<button type="button" role="tab" class="${setTabNow === k ? "on" : ""}" data-act="setTab" data-val="${k}" aria-selected="${setTabNow === k}">${l}</button>`).join("")}</div>
+    <div class="mbody" id="s-check"${setTabNow === "check" ? "" : " hidden"}><div id="ckset"></div></div>
+    <div class="mbody" id="s-notify"${setTabNow === "notify" ? "" : " hidden"}>
+      <div class="mtools"><input type="search" id="nSearch" placeholder="名前で探す" value="${esc(nQuery)}" autocomplete="off" aria-label="名前で探す"></div>
+      <div class="hint">オンにした人のスマホに届きます（最初は全員オフ）。返却予定日・返却遅れは、本人の予約の分だけ届きます。押したときにすぐ保存されます</div>
+      <div id="ntable" class="ntable-wrap"></div>
+    </div>
+    <div class="mbody" id="s-basic"${setTabNow === "basic" ? "" : " hidden"}>
+      <p class="ferr" id="ferr" hidden></p>
+      <div class="field"><label>名簿</label>
+        <div class="mtools">
+          ${NIPPO_WORKERS_URL ? `<button type="button" class="btn primary small" data-act="memImport">日報の名簿から取り込む</button>` : ""}
+          <input type="search" id="memSearch" placeholder="名前・所属で探す" value="${esc(memQuery)}" autocomplete="off" aria-label="名簿を探す">
+        </div>
+        <div class="hint">スマホの「あなたの名前」と、予約の「別の人にする」に出ます。車を使わない人は「隠す」にしてください。<br>名簿の変更（取り込み・隠す・追加）は、押したときにすぐ保存されます</div>
+        <div id="mlist" class="mlist"></div>
+        <div class="madd">
+          <input id="madd-name" placeholder="名前" maxlength="30" autocomplete="off" aria-label="追加する人の名前">
+          <select id="madd-kubun" aria-label="区分">${MGROUPS.map(g => `<option>${g}</option>`).join("")}</select>
+          <input id="madd-shozoku" placeholder="所属（例：${esc(COMPANY.name || "")}）" maxlength="30" autocomplete="off" aria-label="所属">
+          <button type="button" class="btn ghost small" data-act="memAdd">＋ 1人追加</button>
+        </div></div>
+      <div class="field"><label>現場リスト</label>
+        <div class="ilist" id="site-list">${(st.sites || []).map(x => itemRow("site", x)).join("")}</div>
+        <div class="iadd"><input id="site-new" placeholder="新しい現場の名前" maxlength="100" autocomplete="off" aria-label="新しい現場の名前">
+          <button type="button" class="btn ghost small" data-act="itemAdd" data-val="site">＋ 新しく追加</button></div>
+        <div class="hint">予約の「行く現場」に出ます（リストにない現場は「その他」で入力できます）。名前はそのまま書きかえられます</div></div>
+      <div class="field"><label>駐車場（${LOT_MAX}ヶ所まで）</label>
+        <div class="ilist" id="lot-list">${lots.filter(Boolean).map(x => itemRow("lot", x)).join("")}</div>
+        <div class="iadd" id="lot-add"${lots.filter(Boolean).length >= LOT_MAX ? " hidden" : ""}><input id="lot-new" placeholder="新しい駐車場の名前" maxlength="30" autocomplete="off" aria-label="新しい駐車場の名前">
+          <button type="button" class="btn ghost small" data-act="itemAdd" data-val="lot">＋ 新しく追加</button></div>
+        <div class="hint">返却のときのボタンに出ます（1ヶ所は必要）。名前を変えると、その駐車場にある車の置き場所も新しい名前になります</div></div>
+      <div class="field"><label for="s-days">車検の通知（何日前から）</label>
+        <div class="days-in"><input id="s-days" name="shakenAlertDays" type="number" inputmode="numeric" min="1" max="365" value="${esc(st.shakenAlertDays || 30)}"><span>日前から</span></div>
+        <div class="hint">スマホの車両カードに「🔔 車検」が出始める日数です（はじめは30日）</div></div>
+    </div>
+    <div class="mfoot"><span class="sp"></span>
+      <button type="button" class="btn ghost" data-act="close" id="s-cancel">${setTabNow !== "basic" ? "閉じる" : "やめる"}</button>
+      <button type="submit" class="btn primary" id="s-save"${setTabNow !== "basic" ? " hidden" : ""}>保存する</button>
+    </div>
+  </form></div>`;
+  $("modal").hidden = false;
+  renderMemberList();
+  renderNotifyTable();
+  renderCheckSettings();
+}
+// 設定のタブ（基本・通知・点検）。入力中の内容が消えないよう、描き直さずに切り替える。通知・点検は押したときにすぐ保存
+let setTabNow = "basic";
+function showSetTab(k) {
+  setTabNow = k;
+  document.querySelectorAll(".stabs [data-act=setTab]").forEach(b => { b.classList.toggle("on", b.dataset.val === k); b.setAttribute("aria-selected", b.dataset.val === k); });
+  $("s-basic").hidden = k !== "basic"; $("s-notify").hidden = k !== "notify"; $("s-check").hidden = k !== "check";
+  $("s-save").hidden = k !== "basic"; $("s-cancel").textContent = k !== "basic" ? "閉じる" : "やめる";
+}
+
+// 設定 → 通知：名簿の人が行、4つの通知が列。チェックでオン・オフ（すぐ保存）
+let nQuery = "";
+// 整備工場の人（専用ページで名前を入れた人）。名前は「佐々木（さくら自動車）」の形。届く通知は SHOP_TYPES（修理依頼・車検・預けられる日が決まった）だけ
+const shortShop = n => n.replace(/（[^（）]*）$/, "");
+const nMatch = n => { const q = nQuery.trim(); return !q || n.includes(q); };
+const nVisible = () => activeMembers().filter(m => nMatch(m.name));
+const nVisibleShop = () => S.shopUsers.filter(nMatch);
+function renderNotifyTable() {
+  const el = $("ntable"); if (!el) return;
+  const list = nVisible();
+  if (!activeMembers().length && !S.shopUsers.length) { el.innerHTML = `<div class="empty">名簿がまだありません。「基本」タブで名簿を取り込んでください</div>`; return; }
+  // 端末の登録：許可済みなら端末の種類と登録した日。通知がオンなのに未許可の人は赤で目立たせる（このままでは何も届かない）
+  const PLAT = { ios: "iPhone", android: "Android", pc: "PC" };
+  const anyOn = n => NTYPES.some(([k]) => (S.notify[k] || []).includes(n));
+  const status = n => {
+    const ts = S.tokens.filter(t => t.name === n);
+    if (!ts.length) return `<small class="pst${anyOn(n) ? " ng" : ""}"${anyOn(n) ? ' title="スマホで「🔔 通知をオンにする」を押していないので、何も届きません"' : ""}>未許可</small>`;
+    const last = new Date(Math.max(...ts.map(t => t.at)));
+    const kinds = ts.map(t => PLAT[t.platform] || t.platform).join("・");
+    return `<small class="pst ok">スマホ許可済み</small><small class="pdate">${esc(kinds)}　登録 ${last.getMonth() + 1}/${last.getDate()}</small>`;
+  };
+  const rowCls = n => (anyOn(n) && !S.tokenNames.has(n) ? ' class="nng"' : "");
+  const onPeople = [...activeMembers().map(m => m.name), ...S.shopUsers].filter(anyOn);
+  const ngN = onPeople.filter(n => !S.tokenNames.has(n)).length;
+  const summary = onPeople.length ? `<div class="nsum">通知がオンの人 ${onPeople.length}人のうち、スマホで許可済み ${onPeople.length - ngN}人・<b>未許可 ${ngN}人</b>（未許可の人には何も届きません。スマホの「🔔 通知をオンにする」を押してもらってください）</div>` : "";
+  const shop = nVisibleShop().sort((a, b) => a.localeCompare(b, "ja"));
+  const shopRows = !shop.length ? "" : `<tr class="ngrp"><td colspan="${NTYPES.length + 1}">${SHOP_NAME}</td></tr>` + shop.map(n => `<tr${rowCls(n)}>
+      <td class="nname"><b>${esc(shortShop(n))}</b>${status(n)}</td>
+      ${NTYPES.map(([k, l]) => (SHOP_TYPES.includes(k)
+        ? `<td><input type="checkbox" data-ntype="${k}" data-name="${esc(n)}"${(S.notify[k] || []).includes(n) ? " checked" : ""} aria-label="${esc(n)} ${l}"></td>`
+        : `<td class="nna">—</td>`)).join("")}</tr>`).join("");
+  const rows = MGROUPS.map(g => {
+    const ms = list.filter(m => mGroupOf(m) === g).sort((a, b) => byLen(a.name, b.name));
+    return !ms.length ? "" : `<tr class="ngrp"><td colspan="${NTYPES.length + 1}">${g}</td></tr>` + ms.map(m => `<tr${rowCls(m.name)}>
+      <td class="nname"><b>${esc(m.name)}</b>${status(m.name)}</td>
+      ${NTYPES.map(([k, l]) => (STAFF_TYPES.includes(k)
+        ? `<td><input type="checkbox" data-ntype="${k}" data-name="${esc(m.name)}"${(S.notify[k] || []).includes(m.name) ? " checked" : ""} aria-label="${esc(m.name)} ${l}"></td>`
+        : `<td class="nna">—</td>`)).join("")}</tr>`).join("");
+  }).join("") + shopRows;
+  el.innerHTML = summary + `<table class="ntable"><thead><tr><th>名前</th>${NTYPES.map(([k, l, when]) =>
+    `<th>${l}<small>${when()}</small><div class="nall"><button type="button" class="btn ghost small" data-act="nAll" data-val="${k}" data-id="on">全員オン</button><button type="button" class="btn ghost small" data-act="nAll" data-val="${k}" data-id="off">全員オフ</button></div></th>`).join("")}</tr></thead>
+    <tbody>${rows || `<tr><td colspan="${NTYPES.length + 1}"><div class="empty">該当する名前がありません</div></td></tr>`}</tbody></table>`;
+}
+function setNotify(type, names, on) {
+  if (!names.length) return;
+  setDoc(doc(db, "settings", "notify"), { [type]: on ? arrayUnion(...names) : arrayRemove(...names), updatedAt: serverTimestamp() }, { merge: true })
+    .catch(e => { console.error(e); toast("変更できませんでした。もう一度お試しください", "err"); });
+}
+// 列ごとの「全員オン」「全員オフ」（名前で探しているときは、出ている人だけ）
+function setNotifyAll(type, on) {
+  const names = [...(STAFF_TYPES.includes(type) ? nVisible().map(m => m.name) : []), ...(SHOP_TYPES.includes(type) ? nVisibleShop() : [])];
+  const label = NTYPES.find(t => t[0] === type)[1];
+  if (!confirm(`「${label}」の通知を、${nQuery.trim() ? `表示している ${names.length}人` : `全員（${names.length}人）`}${on ? "オン" : "オフ"}にしますか？`)) return;
+  setNotify(type, names, on);
+}
+
+let memQuery = "";
+// 設定画面の名簿一覧（区分ごと。隠した人も「隠し中」で出す）
+function renderMemberList() {
+  const el = $("mlist"); if (!el) return;
+  const q = memQuery.trim();
+  const all = S.members;
+  const hidden = all.filter(m => m.active === false).length;
+  if (!all.length) { el.innerHTML = `<div class="empty">名簿はまだありません。${NIPPO_WORKERS_URL ? "「日報の名簿から取り込む」を押すか、" : ""}下の欄から1人ずつ追加してください</div>`; return; }
+  let html = `<div class="mcount">${all.length}人（隠し中 ${hidden}人）</div>`;
+  MGROUPS.forEach(g => {
+    const list = all.filter(m => mGroupOf(m) === g && (!q || m.name.includes(q) || (m.shozoku || "").includes(q)))
+      .sort((a, b) => ((a.active === false) - (b.active === false)) || (a.shozoku || "").localeCompare(b.shozoku || "", "ja") || byLen(a.name, b.name));
+    if (!list.length) return;
+    html += `<div class="mgroup">${g}<span>${list.length}人</span></div>` + list.map(m => `
+      <div class="mrow${m.active === false ? " off" : ""}"><b>${esc(m.name)}</b><span class="mso">${esc(m.shozoku || "")}</span>
+        ${m.active === false ? '<span class="tag">隠し中</span>' : ""}
+        <button type="button" class="btn ${m.active === false ? "primary" : "ghost"} small" data-act="memToggle" data-id="${m.id}">${m.active === false ? "表示する" : "隠す"}</button></div>`).join("");
+  });
+  el.innerHTML = html;
+}
+function toggleMember(id) {
+  const m = S.members.find(x => x.id === id); if (!m) return;
+  updateDoc(doc(db, "members", id), { active: m.active === false, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("変更できませんでした。もう一度お試しください"); });
+}
+function addMember() {
+  const name = $("madd-name").value.trim(), kubun = $("madd-kubun").value, shozoku = $("madd-shozoku").value.trim();
+  if (!name) { toast("名前を入れてください"); $("madd-name").focus(); return; }
+  if (/[.#$[\]/]/.test(name)) { toast("名前に使えない記号が入っています"); return; }
+  const dup = S.members.find(m => m.name === name);
+  if (dup) { toast(`「${name}」はもう名簿にあります${dup.active === false ? "（隠し中）" : ""}`); return; }
+  setDoc(doc(collection(db, "members")), { name, kubun, shozoku, active: true, source: "manual", createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("追加できませんでした。もう一度お試しください"); });
+  $("madd-name").value = ""; $("madd-shozoku").value = "";
+  toast(`「${name}」を追加しました`);
+}
+// 日報アプリの名簿（Realtime Database の master/workers）を読んで、まだいない人だけ足す
+const NIPPO_WORKERS_URL = COMPANY.nippoUrl || ""; // 空なら「日報の名簿から取り込む」ボタンを出さない
+async function importFromNippo() {
+  if (!NIPPO_WORKERS_URL) return; // 日報アプリの住所がない会社では使わない
+  let workers;
+  try {
+    const res = await fetch(NIPPO_WORKERS_URL, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    workers = Object.entries(await res.json() || {}).map(([key, w]) => ({ key, ...w }))
+      .filter(w => w && typeof w.name === "string" && w.name.trim());
+  } catch (e) {
+    console.error(e); toast("日報の名簿を読めませんでした。電波や日報アプリの設定を確認してください"); return;
+  }
+  const have = new Set(S.members.map(m => m.name));
+  const add = workers.filter(w => !have.has(w.name.trim()));
+  if (!add.length) { toast(`日報の名簿 ${workers.length}人は、全員もう入っています`); return; }
+  const hiddenNew = add.filter(w => w.active === false).length;
+  if (!confirm(`日報の名簿 ${workers.length}人のうち、まだいない ${add.length}人を足します。
+（すでにいる ${workers.length - add.length}人はそのまま。日報で隠している人は、ここでも隠した状態で入ります：${hiddenNew}人）
+
+取り込みますか？`)) return;
+  try {
+    for (let i = 0; i < add.length; i += 400) {
+      const b = writeBatch(db);
+      add.slice(i, i + 400).forEach(w => b.set(doc(collection(db, "members")), {
+        name: w.name.trim().slice(0, 30), kubun: mGroupOf(w), shozoku: String(w.shozoku || "").trim().slice(0, 30),
+        active: w.active !== false, source: "nippo", nippoKey: w.key, createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+      }));
+      await b.commit();
+    }
+    toast(`${add.length}人を名簿に足しました`);
+  } catch (e) { console.error(e); toast("取り込めませんでした。Firebase のルールを確認してください"); }
+}
+
+function saveSettings(form) {
+  const f = new FormData(form);
+  // 「新しく追加」の欄に書いたまま保存したときも、足してから保存する
+  ["site", "lot"].forEach(k => { const n = $(`${k}-new`); if (n && n.value.trim()) itemAdd(k); });
+  const all = k => [...form.querySelectorAll(`input[name="${k}"]`)].map(x => x.value.trim());
+  const sites = [...new Set(all("site").filter(Boolean))].map(x => x.slice(0, 100));
+  const slots = all("lot"), olds = all("lotOld"); // 行ごとの今の名前と、開いたときの名前（新しく足した行は空）
+  const lots = slots.filter(Boolean);
+  const days = Number(toHalf(String(f.get("shakenAlertDays") || "")));
+  let err = "";
+  if (!lots.length) err = "駐車場を1ヶ所以上入れてください";
+  else if (lots.length > LOT_MAX) err = `駐車場は${LOT_MAX}ヶ所までです`;
+  else if (new Set(lots).size < lots.length) err = "同じ名前の駐車場があります";
+  else if (!Number.isInteger(days) || days < 1 || days > 365) err = "車検の通知は 1〜365 の数字で入れてください";
+  if (err) { const e = $("ferr"); e.textContent = err; e.hidden = false; return; }
+
+  // 駐車場の名前を変えたら（同じ欄で名前が変わったら）、その名前の車の「置き場所」も書きかえる
+  const old = S.settings.lots || [];
+  const renames = new Map(olds.map((o, i) => [o, slots[i]]).filter(([o, n]) => o && n && o !== n && !lots.includes(o)));
+  // 消した駐車場に車が残っているときは確かめる（車の置き場所は、その名前のまま残る）
+  const removed = old.filter(o => !lots.includes(o) && !renames.has(o));
+  const left = S.vehicles.filter(v => !v.retired && (removed.includes(v.homeLot) || removed.includes(v.currentLot)));
+  if (left.length && !confirm(`「${removed.join("」「")}」を駐車場から外します。
+この駐車場が置き場所になっている車が ${left.length}台あります（置き場所の名前はそのまま残ります）。
+あとで「車両を修正」で置き場所を直してください。
+
+保存しますか？`)) return;
+
+  const b = writeBatch(db);
+  b.set(doc(db, "settings", "app"), { sites, lots, shakenAlertDays: days, updatedAt: serverTimestamp() }, { merge: true });
+  if (renames.size) {
+    S.vehicles.forEach(v => {
+      const up = {};
+      if (renames.has(v.homeLot)) up.homeLot = renames.get(v.homeLot);
+      if (renames.has(v.currentLot)) up.currentLot = renames.get(v.currentLot);
+      if (Object.keys(up).length) b.update(doc(db, "vehicles", v.id), { ...up, updatedAt: serverTimestamp() });
+    });
+  }
+  b.commit().catch(e => { console.error(e); toast("設定を保存できませんでした。もう一度お試しください"); });
+  closeModal();
+  toast("設定を保存しました");
+}
+
+// 全角の数字・ハイフンを半角に（入力ゆれ対策）
+const toHalf = s => s.replace(/[０-９Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[－ー−‐]/g, "-");
+
+function saveVehicle(form) {
+  const f = new FormData(form);
+  const g = k => String(f.get(k) || "").trim();
+  const data = {
+    plateArea: g("plateArea"), plateClass: toHalf(g("plateClass")).toUpperCase(), plateKana: g("plateKana"),
+    plateNum: toHalf(g("plateNum")), kind: g("kind"), type: g("type"), shakenDate: g("shakenDate"), homeLot: g("lot"), currentLot: g("lot"), // 置き場所は1つ（通常・今の両方に同じ値）
+    license: LICENSES.includes(g("license")) ? g("license") : "普通", owner: g("owner") || null,
+  };
+  // 点検表がオンのときだけ出る欄（いつも乗る人・エアタンク・前回のオイル／タイヤ交換の年月）
+  if (form.querySelector('[name="airTank"]')) {
+    data.airTank = g("airTank") === "1"; data.driver = g("driver") || null;
+    ["oilAt", "tireAt", "studAt"].forEach(k => { const s = toHalf(g(k)).replace(/[年/.]/g, "-").replace(/月$/, ""), mm = s.match(/^(\d{4})-(\d{1,2})$/); data[k] = mm && Number(mm[2]) >= 1 && Number(mm[2]) <= 12 ? `${mm[1]}-${pad(Number(mm[2]))}` : (s ? "?" : null); });
+  }
+  const badYm = ["oilAt", "tireAt", "studAt"].find(k => data[k] === "?");
+  let err = "";
+  if (!data.plateArea || !data.plateClass || !data.plateKana || !data.plateNum) err = "ナンバーを4つとも入れてください";
+  else if (!/^[0-9A-Z]{1,3}$/.test(data.plateClass)) err = "分類番号は3けたまでの数字で入れてください（例：300）";
+  else if (!data.kind) err = "車種を入れてください";
+  else if (!TYPES.includes(data.type)) err = "種類（トラック／バン／普通車）を選んでください";
+  else if (!/^\d{4}-\d{2}-\d{2}$/.test(data.shakenDate)) err = "車検満了日を入れてください";
+  else if (!data.homeLot) err = "置き場所を選んでください";
+  else if (badYm) err = "前回のオイル・タイヤ交換は、年と月を「2026-07」の形で入れてください";
+  else {
+    const key = x => [x.plateArea, x.plateClass, x.plateKana, x.plateNum].join(" ");
+    const dup = S.vehicles.find(x => x.id !== modalId && key(x) === key(data));
+    if (dup) err = `同じナンバーの車がすでにあります（${dup.kind}${dup.retired ? "・廃車済み" : ""}）`;
+  }
+  if (!err && $("f-prev") && $("f-prev").querySelector(".loading-thumb")) err = "写真を読み込んでいます。少し待ってから保存してください";
+  if (err) { const e = $("ferr"); e.textContent = err; e.hidden = false; return; }
+
+  // 電波が悪くても画面はすぐ閉じる（Firestore が裏で送る）
+  const ref = modalId ? doc(db, "vehicles", modalId) : doc(collection(db, "vehicles"));
+  const p = modalId
+    ? updateDoc(ref, { ...data, updatedAt: serverTimestamp() })
+    : setDoc(ref, {
+        ...data, photoUrl: null, status: "free", retired: false, hidden: false,
+        createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+      });
+  const file = pendingPhoto && pendingPhoto.file;
+  toast(modalId ? "保存しました" : "登録しました");
+  closeModal();
+  p.catch(e => { console.error(e); toast("保存できませんでした。もう一度お試しください"); });
+  if (file) setVehiclePhoto(ref.id, file);
+}
+
+function retireVehicle(id) {
+  const v = byId(id); if (!v) return;
+  if (!confirm(`「${v.kind}（${v.plateKana} ${v.plateNum}）」を廃車にしますか？\n\n一覧から消えますが、データは残ります。\nあとで「廃車済み」から戻すこともできます。`)) return;
+  closeModal();
+  updateDoc(doc(db, "vehicles", id), { retired: true, retiredAt: serverTimestamp(), updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("廃車にできませんでした"); });
+  toast("廃車にしました");
+}
+// 一時的に隠す（廃車とは別。データ・予約・修理の記録はそのまま）
+function setHidden(id, on) {
+  const v = byId(id); if (!v) return;
+  if (on && !confirm(`「${v.kind}（${v.plateKana} ${v.plateNum}）」を一時的に隠しますか？\n\nスマホの一覧・車検タブと、PCの上のパネルに出なくなります。\n車のデータ・予約・修理の記録はそのまま残り、「非表示中」から戻せます。`)) return;
+  closeModal();
+  updateDoc(doc(db, "vehicles", id), { hidden: on, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("変更できませんでした"); });
+  toast(on ? "一時的に隠しました" : "表示に戻しました");
+}
+function restoreVehicle(id) {
+  updateDoc(doc(db, "vehicles", id), { retired: false, retiredAt: null, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("戻せませんでした"); });
+  toast("一覧に戻しました");
+}
+
+/* ---------- 車検に出す・車検から戻す（PCのみ） ---------- */
+// 記録は inspections に残す（どの車・出した日・戻した日・前と新しい満了日・操作した人）
+const operator = () => ME || "事務所（PC）";
+function inspHead(v, title) {
+  return `<div class="overlay"><form class="modal panel imodal" id="${title === "車検に出す" ? "ioform" : "ibform"}" data-id="${v.id}" novalidate>
+    <h2>${title}<button type="button" class="x" data-act="close" aria-label="閉じる">×</button></h2>
+    <div class="mbody"><div class="ihead">${plateHtml(v, true)}<b>${esc(v.kind)}</b></div><p class="ferr" id="ferr" hidden></p>`;
+}
+const inspFoot = (v, ok) => `</div><div class="mfoot"><span class="sp"></span>
+    <button type="button" class="btn ghost" data-act="edit" data-id="${v.id}">やめる</button>
+    <button type="submit" class="btn primary" id="i-ok">${ok}</button></div></form></div>`;
+function showFerr(msg) { const e = $("ferr"); e.textContent = msg; e.hidden = false; }
+
+function openInspOut(id) {
+  const v = byId(id); if (!v) return;
+  closeModal();
+  const t = ymd(today());
+  $("modal").innerHTML = inspHead(v, "車検に出す") + `
+    <div class="field"><label for="io-from">出した日</label><input type="date" id="io-from" name="from" value="${t}" max="${t}"></div>
+    <div class="field"><label for="io-until">戻り予定日（任意）</label><input type="date" id="io-until" name="until" min="${t}"></div>
+    <div id="io-clash"></div>` + inspFoot(v, "車検に出す");
+  $("modal").hidden = false;
+}
+// 車検に出す期間にかかる予約（戻り予定日がなければ、出した日〜今日）
+function inspClashes(v, from, until) {
+  const to = until || ymd(today());
+  return S.reservations.filter(r => r.vehicleId === v.id && !r.returnedAt && !r.canceled && r.from <= to && from <= effTo(r))
+    .sort((a, b) => (a.from > b.from ? 1 : -1));
+}
+function saveInspOut(f) {
+  const v = byId(f.dataset.id); if (!v) return;
+  const from = f.from.value, until = f.until.value || null, t = ymd(today());
+  if (!from) return showFerr("出した日を入れてください");
+  if (from > t) return showFerr("出した日は今日までの日にしてください");
+  if (until && until < from) return showFerr("戻り予定日は出した日より後にしてください");
+  // その期間に予約があれば、一覧を出して確かめる（もう一度押すと出す）
+  const clash = inspClashes(v, from, until);
+  if (clash.length && f.dataset.ok !== "1") {
+    $("io-clash").innerHTML = `<div class="iclash"><b>この期間に入っている予約があります</b>${clash.map(r =>
+      `<div>${rangeText(r)}　${esc(r.who)}さん　${esc(r.site)}</div>`).join("")}<p>このまま車検に出しますか？</p></div>`;
+    $("i-ok").textContent = "このまま車検に出す"; f.dataset.ok = "1";
+    return;
+  }
+  const rec = doc(collection(db, "inspections"));
+  const b = writeBatch(db);
+  b.set(rec, {
+    vehicleId: v.id, outDate: from, expectedBack: until, backDate: null,
+    oldShakenDate: v.shakenDate, newShakenDate: null, outBy: operator(), backBy: null, returnedLot: null,
+    outAt: serverTimestamp(), backAt: null,
+    prev: { currentLot: v.currentLot || null, availDate: v.availDate || null, shopWish: v.shopWish || null }, // 車検に出す前の状態（間違えたときに「車検を取り消す」で戻す）
+  });
+  b.update(doc(db, "vehicles", v.id), { inspection: { id: rec.id, from, until }, availDate: null, shopWish: null, updatedAt: serverTimestamp() });
+  b.commit().catch(e => { console.error(e); toast("車検に出せませんでした。もう一度お試しください", "err"); });
+  closeModal();
+  toast("車検に出しました");
+}
+// 日付の入力を変えたら、予約の確認をやり直す
+function resetInspConfirm() {
+  const f = $("ioform"); if (!f || f.dataset.ok !== "1") return;
+  delete f.dataset.ok; $("io-clash").innerHTML = ""; $("i-ok").textContent = "車検に出す";
+}
+
+function openInspBack(id) {
+  const v = byId(id); if (!v || !v.inspection) return;
+  closeModal();
+  const lots = (S.settings.lots || []).filter(Boolean).slice(0, LOT_MAX);
+  $("modal").innerHTML = inspHead(v, "車検から戻す") + `
+    <div class="field"><label for="ib-date">新しい車検満了日</label>
+      <div class="shk-in"><input type="date" id="ib-date" name="shakenDate">
+        <button type="button" class="btn ghost small" data-act="shkPlus" data-val="1">＋1年</button>
+        <button type="button" class="btn ghost small" data-act="shkPlus" data-val="2">＋2年</button>
+        <span class="shk-now">今：${jp(v.shakenDate)}</span></div></div>
+    <div class="field"><label>置き場所</label><div class="seg">${lots.map(l =>
+      `<label class="chip"><input type="radio" name="lot" value="${esc(l)}">${esc(l)}</label>`).join("")}</div></div>` + inspFoot(v, "戻す");
+  $("modal").hidden = false;
+}
+// 「＋1年」「＋2年」：今の満了日から
+function shakenPlus(n) {
+  const f = $("ibform"), v = f && byId(f.dataset.id); if (!v) return;
+  const d = parse(v.shakenDate); d.setFullYear(d.getFullYear() + Number(n));
+  f.shakenDate.value = ymd(d);
+}
+function saveInspBack(f) {
+  const v = byId(f.dataset.id); if (!v || !v.inspection) { closeModal(); return; }
+  const date = f.shakenDate.value, lot = (f.querySelector("input[name=lot]:checked") || {}).value;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return showFerr("新しい車検満了日を入れてください");
+  if (date <= v.shakenDate) return showFerr(`新しい車検満了日は、今の満了日（${jp(v.shakenDate)}）より後にしてください`);
+  if (!lot) return showFerr("置き場所を選んでください");
+  const b = writeBatch(db);
+  b.update(doc(db, "vehicles", v.id), { shakenDate: date, currentLot: lot, inspection: null, availDate: null, shopWish: null, updatedAt: serverTimestamp() });
+  if (v.inspection.id) b.set(doc(db, "inspections", v.inspection.id), {
+    vehicleId: v.id, backDate: ymd(today()), newShakenDate: date, backBy: operator(), returnedLot: lot, backAt: serverTimestamp(),
+  }, { merge: true });
+  b.commit().catch(e => { console.error(e); toast("戻せませんでした。もう一度お試しください", "err"); });
+  closeModal();
+  toast(`車検から戻しました（次の満了日 ${fmt(date)}）`);
+}
+
+/* ---------- 間違えて車検中・修理中にしたときの取り消し（PCのみ） ---------- */
+// 車検中・修理中にしたときに残した前の状態（置き場所・預けられる日・修理依頼の状態）に戻す
+// 記録は消さない（車検の記録は canceled、修理依頼は inRepairCanceled に、だれがいつ取り消したかを残す）
+// 前の状態がない古い記録（版22まで）は、車検中・修理中の印だけを外す
+const carName = v => `${v.kind}（${v.plateKana} ${v.plateNum}）`;
+async function undoInsp(id) {
+  const v = byId(id); if (!v || !v.inspection) return;
+  const x = v.inspection;
+  let rec = null;
+  if (x.id) {
+    try { const s = await getDocFromServer(doc(db, "inspections", x.id)); rec = s.exists() ? s.data() : null; }
+    catch (e) { console.error(e); toast("取り消せませんでした。電波のよい所でもう一度お試しください", "err"); return; }
+  }
+  const prev = rec && rec.prev, lot = prev && prev.currentLot && prev.currentLot !== v.currentLot ? prev.currentLot : null;
+  if (!confirm(`本当に取り消しますか？\n\n「${carName(v)}」の「車検中」${inspText(x)}を取り消して、車検に出す前の状態に戻します。\n・置き場所：${lot ? `${v.currentLot || "—"} → ${lot}` : `${lotOf(v) || "—"}（そのまま）`}\n・車検の満了日：${jp(v.shakenDate)}（変わりません）\n・車検の記録は消さずに「取り消し」として残ります\n\n車検から戻ってきたときは、これではなく「車検から戻す」を押してください。`)) return;
+  const now = byId(id); if (!now || !now.inspection || now.inspection.id !== x.id) { closeModal(); return; } // 確かめている間にほかの所で変わった
+  const data = { inspection: null, updatedAt: serverTimestamp() };
+  if (prev) data.availDate = prev.availDate || null;
+  if (prev && "shopWish" in prev) data.shopWish = prev.shopWish || null; // 整備工場の希望日も戻す（版24から）
+  if (lot) data.currentLot = lot;
+  const b = writeBatch(db);
+  b.update(doc(db, "vehicles", v.id), data);
+  if (rec) b.set(doc(db, "inspections", x.id), { canceled: true, canceledAt: serverTimestamp(), canceledBy: operator() }, { merge: true });
+  b.commit().catch(e => { console.error(e); toast("取り消せませんでした。もう一度お試しください", "err"); });
+  closeModal();
+  toast("車検中を取り消しました");
+}
+// rs：同じ車の「修理中」の修理依頼（修理依頼の欄からは1件、車の画面からはその車の全部）
+function undoRepair(rs) {
+  rs = rs.filter(r => r && r.status === "in_repair"); if (!rs.length) return;
+  const v = byId(rs[0].vehicleId);
+  const p = rs.map(r => r.prev).find(x => x && x.currentLot) || {};
+  const lot = v && p.currentLot && p.currentLot !== v.currentLot ? p.currentLot : null;
+  const what = rs.map(r => `・${repairText(r) || "修理依頼"}${r.shop ? `（${shopText(r)}）` : ""}`).join("\n");
+  if (!confirm(`本当に取り消しますか？\n\n「${v ? carName(v) : "この車"}」の「修理中」を取り消して、修理中にする前の状態（未対応の修理依頼）に戻します。\n${what}\n・置き場所：${lot ? `${v.currentLot || "—"} → ${lot}` : `${v ? lotOf(v) || "—" : "—"}（そのまま）`}\n・修理依頼の記録は消えません\n\n修理が終わったときは、これではなく「修理完了」を押してください。`)) return;
+  const b = writeBatch(db);
+  rs.forEach(r => b.update(doc(db, "repairs", r.id), {
+    status: "open", // 修理中にできるのは未対応の依頼だけなので、前の状態は「未対応」
+    shop: null, prev: null, // 整備工場の「預かり中」からも消える
+    inRepairCanceled: { at: serverTimestamp(), by: operator(), shop: r.shop || null },
+    updatedAt: serverTimestamp(),
+  }));
+  if (lot) b.update(doc(db, "vehicles", v.id), { currentLot: lot, updatedAt: serverTimestamp() });
+  b.commit().catch(e => { console.error(e); toast("取り消せませんでした。もう一度お試しください", "err"); });
+  closeModal();
+  toast("修理中を取り消しました");
+}
+
+/* ================= 点検（日常・1ヶ月点検。設定で「点検表をつかう」をオンにしたときだけ出す） ================= */
+// 記録は checks（1台1日に1つ。ID は「車のID_日付」）：vehicleId・date・monthly（月末の点検もしたか）・res（項目ID → ok／ng）
+// ・memo（問題ありの一言）・ng（問題ありの数）・meter（月末のメーター）・by（点検した人）・confirmed／confirmedBy（PCで確認した人＝印）・repairId
+// 最初の項目（日常・1ヶ月点検リストの24こ）。m＝月末だけ、d＝毎日。1＝エアタンクのある車だけ
+const CHECK_DEFAULT = [
+  ["i01", "ブレーキ", "ブレーキペダルの踏みしろ・効き具合", "d", 0], ["i02", "ブレーキ", "ブレーキの液量", "m", 0],
+  ["i03", "ブレーキ", "エアブレーキの空気圧力計の上がり具合", "d", 1], ["i04", "ブレーキ", "排気音の正常", "d", 1],
+  ["i05", "ブレーキ", "駐車ブレーキの効き具合", "d", 0],
+  ["i06", "タイヤの点検", "ホイールの取付状態", "m", 0], ["i07", "タイヤの点検", "タイヤの空気圧", "d", 0],
+  ["i08", "タイヤの点検", "亀裂・損傷", "d", 0], ["i09", "タイヤの点検", "異常摩耗", "d", 0], ["i10", "タイヤの点検", "溝の深さ", "d", 0],
+  ["i11", "バッテリー", "バッテリーの液量", "m", 0],
+  ["i12", "原動機", "冷却水の量", "m", 0], ["i13", "原動機", "ファン・ベルトの張り具合、損傷", "m", 0], ["i14", "原動機", "エンジン・オイルの量", "m", 0],
+  ["i15", "原動機", "エンジンのかかり具合、異音", "d", 0], ["i16", "原動機", "アイドリング時の回転数", "d", 0],
+  ["i17", "灯火装置・方向指示器", "ヘッドランプ、ブレーキランプ、ウィンカーの点灯または点滅具合", "d", 0],
+  ["i18", "灯火装置・方向指示器", "ヘッドランプ、ブレーキランプ、ウィンカーの汚れ・損傷", "d", 0],
+  ["i19", "ウィンドウォッシャー", "液量・噴射状態", "m", 0], ["i20", "ワイパー", "拭き取り状態", "m", 0],
+  ["i21", "エア・タンク", "タンク内の凝水", "m", 1],
+  ["i22", "車全体", "オイル・液漏れ", "m", 0], ["i23", "車全体", "外装チェック（傷やへこみ等）", "d", 0],
+  ["i24", "ドライブレコーダー", "電源・液晶表示・日時・エラー有無", "m", 0],
+].map(([id, cat, name, f, air]) => ({ id, cat, name, freq: f === "m" ? "monthly" : "daily", air: !!air }));
+// 最初の値は会社ごとの設定（company-config.js の checkOn）。PC の設定で変えたらその値
+const checkOn = () => (S.settings.checkOn === undefined ? !!COMPANY.checkOn : !!S.settings.checkOn);
+// 項目の並び（消した項目も del:true で残す。前の月の表に出すため）
+const allCheckItems = () => (Array.isArray(S.settings.checkItems) ? S.settings.checkItems : CHECK_DEFAULT).filter(x => x && x.id);
+const checkItems = () => allCheckItems().filter(x => !x.del);
+// この車で点検する項目：毎日の項目（月末の点検なら月末の項目も）。エアタンクの項目は「あり」の車だけ
+const itemsFor = (v, monthly) => checkItems().filter(x => (monthly || x.freq !== "monthly") && (!x.air || v.airTank));
+const ymOf = s => String(s).slice(0, 7);
+const checkKey = (vid, d) => `${vid}_${d}`;
+const checkOf = (vid, d) => S.checks.get(checkKey(vid, d)) || null;
+const ngOf = c => Object.values((c && c.res) || {}).filter(x => x === "ng").length;
+const monthlyOf = (vid, ym) => [...S.checks.values()].find(c => c.vehicleId === vid && c.monthly && ymOf(c.date) === ym) || null;
+// その月より前の、いちばん新しい月末のメーター
+const prevMeter = (vid, ym, list = [...S.checks.values()]) => list.filter(c => c.vehicleId === vid && c.monthly && c.meter != null && ymOf(c.date) < ym)
+  .sort((a, b) => (a.date < b.date ? 1 : -1))[0] || null;
+const fmtKm = n => Number(n).toLocaleString("ja-JP");
+// 月の最後の7日は、月末の点検をすすめる
+const monthEndNear = () => { const d = today(); return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate() - d.getDate() < 7; };
+const skipKey = (vid, d) => `taiyo_ckskip_${vid}_${d}`;
+// 乗るときの「点検をお願いします」：今日まだ点検していない・「今日はしない」を押していない
+const checkDue = v => checkOn() && S.checksLoaded && !S.checkErr && !checkOf(v.id, ymd(today())) && !lsGet(skipKey(v.id, ymd(today())));
+// 印（赤い丸）に入れる名前：名字（空白の前）。空白がなければ前の2文字
+const stampName = n => { const s = String(n || "").replace(/（.*$/, "").trim(); return (s.split(/[\s　]+/)[0] || s).slice(0, s.includes(" ") || s.includes("　") ? 3 : 2); };
+const stamp = n => (n ? `<span class="ck-stamp" title="${esc(n)}">${esc(stampName(n))}</span>` : "");
+
+/* ---------- 点検の記録を読む（オンのときだけ。ルールが古くて読めなくても、ほかの画面はそのまま） ---------- */
+let ckStarted = false;
+const ckLive = { recent: new Map(), open: new Map() };
+const ckFrom = () => { const d = today(); return ymd(new Date(d.getFullYear(), d.getMonth() - 1, 1)); }; // 先月の1日から（先月のメーターも使う）
+function startCheckSync() {
+  if (ckStarted) return; ckStarted = true;
+  const merge = () => { S.checks = new Map([...ckLive.open, ...ckLive.recent]); S.checksLoaded = true; S.checkErr = ""; refresh(); };
+  const fail = e => { console.warn("点検の記録を読めません", e); S.checksLoaded = true; S.checkErr = e.code === "permission-denied" ? "点検の記録を読めません（Firebase のルールに点検の場所がまだありません）" : "点検の記録を読めませんでした"; refresh(); };
+  const toMap = snap => new Map(snapList(snap).map(c => [c.id, c]));
+  onSnapshot(query(collection(db, "checks"), where("date", ">=", ckFrom())), snap => { ckLive.recent = toMap(snap); merge(); }, fail);
+  onSnapshot(query(collection(db, "checks"), where("confirmed", "==", false)), snap => { ckLive.open = toMap(snap); merge(); }, fail);
+}
+
+/* ---------- スマホ：点検 ---------- */
+const checkAsk = v => `<div class="mu-check"><span>🔍 乗る前の点検をお願いします</span>
+  <div class="mu-cbtns"><button class="mu-cbtn" data-act="ckStart" data-id="${v.id}">点検する</button><button class="mu-cskip" data-act="ckSkip" data-id="${v.id}">今日はしない</button></div></div>`;
+// 車の詳しい画面の「今日の点検」
+function checkStateText(v) {
+  const c = checkOf(v.id, ymd(today()));
+  if (!c) return "まだ";
+  const n = ngOf(c);
+  return n ? `<span class="warn">問題あり ${n}こ</span>（${esc(c.by || "")}さん）` : `済み（${esc(c.by || "")}さん）`;
+}
+// スマホに出す短い名前（最初の24こ。足した項目は、そのままの名前）と、まとまりの名前
+const CHECK_PH = {
+  i01: "ペダルの踏みしろ・効き具合", i02: "ブレーキ液の量", i03: "エアブレーキの空気圧力計の上がり具合", i04: "排気音が正常か", i05: "駐車ブレーキの効き具合",
+  i06: "ホイールの取付状態", i07: "空気圧", i08: "亀裂・損傷", i09: "異常摩耗", i10: "溝の深さ", i11: "バッテリー液の量",
+  i12: "冷却水の量", i13: "ファン・ベルトの張り具合・損傷", i14: "エンジン・オイルの量", i15: "かかり具合・異音", i16: "アイドリング時の回転数",
+  i17: "点灯・点滅具合", i18: "汚れ・損傷", i19: "ウォッシャー液の量・噴射", i20: "ワイパーの拭き取り", i21: "エアタンク内の凝水",
+  i22: "オイル・液漏れ", i23: "外装（傷・へこみ）", i24: "ドライブレコーダー（電源・表示・日時・エラー）",
+};
+const CHECK_GROUP = { "タイヤの点検": ["タイヤ"], "原動機": ["エンジン"], "灯火装置・方向指示器": ["ライト・ウィンカー", "ヘッドランプ・ブレーキランプ・ウィンカー"] };
+const phName = x => CHECK_PH[x.id] || x.name;
+// 点検の入力中の内容
+const cform = { vid: null, date: "", monthly: false, res: {}, memo: {}, meter: "", err: "", busy: false };
+function resetCform(v) {
+  const d = ymd(today());
+  Object.assign(cform, { vid: v ? v.id : null, date: d, monthly: !!v && monthEndNear() && !monthlyOf(v.id, ymOf(d)), res: {}, memo: {}, meter: "", err: "", busy: false });
+}
+function openCheck(vid, back) {
+  const v = byId(vid); if (!v || !checkOn()) return;
+  resetCform(v); hideSheet();
+  go({ name: "check", id: v.id, back: back || { name: "list", restore: true } });
+}
+// OK・問題ありを押したとき（画面の位置はそのまま。問題ありなら一言の欄へ）
+function ckAnswer(id, val) {
+  if (cform.busy) return;
+  const sc = $("ph-screen"), top = sc.scrollTop;
+  cform.res[id] = val === "ng" ? "ng" : "ok"; if (val !== "ng") delete cform.memo[id];
+  cform.err = ""; render(); sc.scrollTop = top;
+  const m = val === "ng" && document.querySelector(`[data-ckmemo="${id}"]`);
+  if (m) { m.focus({ preventScroll: true }); m.scrollIntoView({ block: "center" }); }
+}
+// 1この行：名前と、大きい「OK」「問題あり」。問題ありなら「どんな状態ですか？」
+function ckRow(x) {
+  const r = cform.res[x.id];
+  return `<div class="ck-row${r === "ng" ? " ng" : ""}"><span class="ck-lab">${esc(phName(x))}${x.air ? `<span class="ck-airtag">エアタンク車だけ</span>` : ""}</span>
+    <button type="button" class="ck-okb" data-act="ckAns" data-id="${x.id}" data-val="ok" aria-pressed="${r === "ok"}">OK</button>
+    <button type="button" class="ck-ngb" data-act="ckAns" data-id="${x.id}" data-val="ng" aria-pressed="${r === "ng"}">問題あり</button></div>
+    ${r === "ng" ? `<div class="ck-ngnote"><label for="ckm-${x.id}">どんな状態ですか？</label>
+      <textarea id="ckm-${x.id}" data-ckmemo="${x.id}" rows="2" maxlength="100" placeholder="例：左うしろのタイヤにキズ">${esc(cform.memo[x.id] || "")}</textarea></div>` : ""}`;
+}
+// 分類ごとのまとまり（毎日の項目）。月末の点検なら、そのあとに「月1回の点検」
+function ckGroups(items) {
+  const gs = [];
+  items.forEach(x => { const g = gs[gs.length - 1]; if (g && g.cat === x.cat) g.items.push(x); else gs.push({ cat: x.cat, items: [x] }); });
+  return gs.map(g => { const [name, sub] = CHECK_GROUP[g.cat] || [g.cat];
+    return `<div class="ck-grp"><div class="ck-gh"><b>${esc(name)}</b>${sub ? `<span>${esc(sub)}</span>` : ""}</div>${g.items.map(ckRow).join("")}</div>`; }).join("");
+}
+function checkForm(v) {
+  if (cform.vid !== v.id) resetCform(v);
+  const items = itemsFor(v, cform.monthly), n = items.length, ym = ymOf(cform.date), mdone = monthlyOf(v.id, ym);
+  const answered = items.filter(x => cform.res[x.id]).length, left = n - answered;
+  const daily = items.filter(x => x.freq !== "monthly"), monthly = items.filter(x => x.freq === "monthly");
+  const airN = checkItems().filter(x => x.air && (cform.monthly || x.freq !== "monthly")).length;
+  const head = `<div class="sheet-title">${esc(v.kind)}</div><p class="sub">${plateText(v)}　${dayLabel(cform.date)}の点検</p>
+    ${airN ? `<p class="ck-info">${v.airTank ? "エアタンクのある車なので、エアの点検も出ます。" : `エアタンクのない車なので、エアの点検（${airN}こ）は出ません。`}</p>` : ""}`;
+  // 月末の点検（今月まだのときだけ選べる）
+  const mon = mdone && !cform.monthly ? "" : `<label class="nsw-row ck-mon"><span>月末の点検もする<small>月1回の点検と、メーターの数字${monthEndNear() && !mdone ? "（今月の分がまだです）" : ""}</small></span>
+    <input type="checkbox" class="switch-in" id="ck-monthly"${cform.monthly ? " checked" : ""} aria-label="月末の点検もする"></label>`;
+  const prog = `<div class="ck-prog"><div class="ck-pt"><b>${answered} / ${n} こ</b><span>ぜんぶ押したら記録できます</span></div><div class="ck-bar"><i style="width:${n ? Math.round(answered / n * 100) : 0}%"></i></div></div>`;
+  const p = cform.monthly ? prevMeter(v.id, ym) : null;
+  const month = cform.monthly ? `<div class="ck-grp"><div class="ck-gh"><b>月1回の点検</b><span>月末だけの項目</span></div>${monthly.map(ckRow).join("")}</div>
+    <div class="ck-grp ck-meter"><div class="ck-gh"><b>メーター（総走行距離）</b></div><div class="ck-mbody">
+      <label for="ck-meter">今のメーターの数字</label>
+      <div class="days-in"><input id="ck-meter" name="ckmeter" inputmode="numeric" autocomplete="off" value="${esc(cform.meter)}" placeholder="例：52340"><span>km</span></div>
+      <div class="ck-km" id="ck-run">${ckRunText(p, cform.meter)}</div></div></div>` : "";
+  return head + mon + prog + ckGroups(daily) + month
+    + (cform.err ? `<p class="ferr">${esc(cform.err)}</p>` : "")
+    + `<div class="actions"><button class="btn primary big" data-act="ckSave" data-id="${v.id}"${cform.busy || left ? " disabled" : ""}>${left ? `あと ${left} こ` : "点検を記録する"}</button></div>`;
+}
+const meterNum = s => Number(toHalf(String(s || "")).replace(/[,，\s]/g, ""));
+function ckRunText(p, meter) {
+  if (!p) return `<div class="row"><span class="k">先月末のメーター</span><span class="v">記録なし</span></div><p class="hint">来月から、走った距離が出ます</p>`;
+  const m = meterNum(meter), ok = String(meter || "").trim() && Number.isFinite(m) && m >= p.meter;
+  return `<div class="row"><span class="k">先月末のメーター（${fmt(p.date)}）</span><span class="v">${fmtKm(p.meter)} km</span></div>
+    <div class="row"><span class="k">今月 走った距離</span><span class="v">${ok ? `${fmtKm(m - p.meter)} km` : "— km"}</span></div>`;
+}
+async function saveCheck(v) {
+  if (cform.busy) return;
+  const items = itemsFor(v, cform.monthly);
+  if (items.some(x => !cform.res[x.id])) return;
+  const noMemo = items.find(x => cform.res[x.id] === "ng" && !String(cform.memo[x.id] || "").trim());
+  if (noMemo) {
+    cform.err = `「${phName(noMemo)}」が問題ありです。どんな状態か書いてください`; render();
+    const m = document.querySelector(`[data-ckmemo="${noMemo.id}"]`); if (m) { m.focus({ preventScroll: true }); m.scrollIntoView({ block: "center" }); }
+    return;
+  }
+  let meter = null;
+  if (cform.monthly) {
+    meter = meterNum(cform.meter);
+    if (!String(cform.meter || "").trim() || !Number.isFinite(meter) || meter <= 0 || meter >= 10000000) { cform.err = "メーターの数字（km）を入れてください"; render(); const m = $("ck-meter"); if (m) m.focus(); return; }
+    meter = Math.round(meter);
+    const p = prevMeter(v.id, ymOf(cform.date));
+    if (p && meter < p.meter && !confirm(`先月のメーター（${fmtKm(p.meter)} km）より小さい数字です。\nこのまま記録しますか？`)) return;
+  }
+  const res = {}, memo = {};
+  items.forEach(x => { res[x.id] = cform.res[x.id]; if (res[x.id] === "ng") memo[x.id] = String(cform.memo[x.id] || "").trim().slice(0, 100); });
+  const ng = Object.keys(memo).length;
+  cform.busy = true;
+  setDoc(doc(db, "checks", checkKey(v.id, cform.date)), {
+    vehicleId: v.id, date: cform.date, monthly: cform.monthly, res, memo, ng, meter, by: ME,
+    at: serverTimestamp(), confirmed: false, confirmedBy: null, confirmedAt: null, repairId: null,
+  }).catch(e => { console.error(e); toast("点検を記録できませんでした。電波のよい所でもう一度点検してください", "err"); });
+  const run = meter != null && prevMeter(v.id, ymOf(cform.date)) ? `。今月走った距離 ${fmtKm(meter - prevMeter(v.id, ymOf(cform.date)).meter)} km` : "";
+  resetCform(null);
+  go({ name: "done", title: "点検を記録しました", msg: (ng ? `問題あり ${ng}こを事務所に知らせました` : "問題はありませんでした") + run });
+}
+
+/* ---------- PC：今日の状況の「点検」パネル（問題ありの車・まだ確認していない点検） ---------- */
+let ckWho = lsGet("taiyo_ck_who") || ""; // 確認する人（点検表のチェック者の印に出る名前）
+const checker = () => ckWho || ME || "";
+const ckSorted = list => [...list].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+const ckItemName = id => { const x = allCheckItems().find(y => y.id === id); return x ? x.name : "（消した項目）"; };
+const ngText = c => Object.entries(c.memo || {}).map(([id, m]) => `${ckItemName(id)}${m ? `：${m}` : ""}`);
+function checkPanel() {
+  if (!checkOn()) return "";
+  const open = ckSorted([...S.checks.values()].filter(c => !c.confirmed && byId(c.vehicleId) && !byId(c.vehicleId).retired));
+  const ng = open.filter(c => ngOf(c)), ok = open.filter(c => !ngOf(c));
+  const names = [...new Set([...activeMembers().map(m => m.name), ...(checker() ? [checker()] : [])])].sort(byLen);
+  const who = `<label class="ck-who">確認する人<select data-ckwho aria-label="確認する人">${checker() ? "" : `<option value="">選んでください</option>`}${names.map(n => `<option${n === checker() ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label>`;
+  const f = foldList("ckok", ok, "件");
+  const row = c => { const v = byId(c.vehicleId); return `${plateHtml(v, true)}<div class="grow"><div class="t">${esc(v.kind)}</div><div class="s">${dayLabel(c.date)}　${esc(c.by || "")}さん${c.monthly ? "　月末点検" : ""}</div>`; };
+  const body = S.checkErr ? `<div class="empty">${esc(S.checkErr)}</div>`
+    : !S.checksLoaded ? `<div class="loading">読み込み中…</div>`
+    : !open.length ? `<div class="empty">確認していない点検はありません</div>`
+    : ng.map(c => `<div class="li ck-ngli">${row(c)}<div class="ck-ngs">${ngText(c).map(t => `<span>✕ ${esc(t)}</span>`).join("")}</div></div>
+        <div class="rbtns"><button class="btn ghost small" data-act="ckConfirm" data-id="${c.id}">確認する</button><button class="btn danger small" data-act="ckRepair" data-id="${c.id}">修理を頼む</button></div></div>`).join("")
+      + (ok.length ? `<div class="ck-okhead"><span>問題なしの点検 <b>${ok.length}件</b></span><button class="btn free small" data-act="ckConfirmOk">全部OKの${ok.length}件をまとめて確認する</button></div>`
+        + f.shown.map(c => `<div class="li">${row(c)}</div><button class="btn ghost small" data-act="ckConfirm" data-id="${c.id}">確認する</button></div>`).join("") + f.more : "");
+  return `<div class="panel ckpanel"><h2><span>点検 ${ng.length ? `<span class="tag">問題あり ${ng.length}件</span>` : ""} <span class="tag plain">確認待ち ${open.length}件</span></span>${who}</h2>${body}</div>`;
+}
+function confirmChecks(ids) {
+  const who = checker();
+  if (!who) { toast("右上の「確認する人」を選んでください"); return; }
+  if (!ids.length) return;
+  const b = writeBatch(db);
+  ids.forEach(id => b.update(doc(db, "checks", id), { confirmed: true, confirmedBy: who, confirmedAt: serverTimestamp() }));
+  b.commit().then(() => { ckMonths.clear(); refresh(); }) // 前の月の点検表も、読み直して印を出す
+    .catch(e => { console.error(e); toast("確認を記録できませんでした。もう一度お試しください", "err"); });
+  toast(`${ids.length}件を確認しました（${who}）`);
+}
+// 問題ありの点検から修理依頼を出す（今の修理依頼の欄に入る）。出したら確認済みにもする
+function repairFromCheck(id) {
+  const c = S.checks.get(id), v = c && byId(c.vehicleId); if (!c || !v) return;
+  const who = checker();
+  if (!who) { toast("右上の「確認する人」を選んでください"); return; }
+  const ngs = ngText(c);
+  if (!confirm(`「${v.kind}」の修理依頼を出しますか？\n\n${ngs.map(t => `・${t}`).join("\n")}\n\n修理依頼の欄に入ります（この点検は確認済みになります）`)) return;
+  // 修理依頼の「どこが悪い？」：項目の分類・名前から近いものを選ぶ
+  const its = Object.keys(c.memo || {}).map(k => allCheckItems().find(x => x.id === k) || { cat: "", name: "" });
+  const symptoms = [...new Set(its.map(x => (x.cat.includes("ブレーキ") ? "ブレーキ" : x.cat.includes("タイヤ") ? "タイヤ" : /外装|傷|へこみ/.test(x.name) ? "傷・へこみ" : /異音/.test(x.name) ? "異音がする" : "その他")))];
+  const ref = doc(collection(db, "repairs")), b = writeBatch(db);
+  b.set(ref, {
+    vehicleId: v.id, symptoms, memo: `点検で問題あり（${fmt(c.date)}）：${ngs.join("／")}`.slice(0, 2000), photoUrls: [], photos: [],
+    reportedBy: c.by || who, status: "open", availDate: null, createdAt: serverTimestamp(), doneAt: null, checkId: c.id, ...(c.sample ? { sample: true } : {}),
+  });
+  b.update(doc(db, "checks", c.id), { repairId: ref.id, confirmed: true, confirmedBy: who, confirmedAt: serverTimestamp() });
+  b.commit().catch(e => { console.error(e); toast("修理依頼を出せませんでした。もう一度お試しください", "err"); });
+  toast("修理依頼に入れました");
+}
+
+/* ---------- PC：点検表（車ごと・月ごと。紙の「日常・1ヶ月点検リスト」と同じ形。A4横で印刷） ---------- */
+const ckUi = { vid: lsGet("taiyo_ck_vid") || "", ym: ymOf(ymd(today())) };
+const ckMonths = new Map(); // 前の月を開いたとき：読んだ記録（月 → 記録の一覧。読み込み中は "loading"）
+const ckCars = () => active().map((v, i) => [v, i]).sort((a, b) => (TYPES.indexOf(a[0].type) - TYPES.indexOf(b[0].type)) || (a[1] - b[1])).map(x => x[0]);
+const ymAdd = (ym, n) => { const [y, m] = ym.split("-").map(Number), d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; };
+// その月の表に使う記録（前の月の月末メーターも使うので、前の月の1日から）。今月・先月は今の記録、それより前は読みに行く
+function ckRecs(ym) {
+  const from = `${ymAdd(ym, -1)}-01`, to = `${ym}-31`;
+  const live = [...S.checks.values()].filter(c => c.date >= from && c.date <= to);
+  if (from >= ckFrom()) return live;
+  const got = ckMonths.get(ym);
+  if (got === undefined) {
+    ckMonths.set(ym, "loading");
+    getDocs(query(collection(db, "checks"), where("date", ">=", from), where("date", "<=", to)))
+      .then(snap => { ckMonths.set(ym, snapList(snap)); refresh(); })
+      .catch(e => { console.warn(e); ckMonths.set(ym, []); toast("前の月の点検を読めませんでした", "err"); refresh(); });
+  }
+  if (!Array.isArray(got)) return null;
+  const m = new Map(got.map(c => [c.id, c])); live.forEach(c => m.set(c.id, c));
+  return [...m.values()];
+}
+const mostOf = list => { const m = new Map(); list.filter(Boolean).forEach(x => m.set(x, (m.get(x) || 0) + 1)); return [...m.entries()].sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || ""; };
+// 日本の祝日（振替休日・国民の休日もふくむ。2020年以降のきまり）。年ごとに作って覚えておく
+const HOLI = new Map();
+function holidays(y) {
+  if (HOLI.has(y)) return HOLI.get(y);
+  const s = new Set(), k = (m, d) => `${y}-${pad(m)}-${pad(d)}`;
+  const nthMon = (m, n) => 1 + ((8 - new Date(y, m - 1, 1).getDay()) % 7) + (n - 1) * 7; // その月の n 回目の月曜
+  const eq = base => Math.floor(base + 0.242194 * (y - 1980) - Math.floor((y - 1980) / 4)); // 春分・秋分（1980〜2099年）
+  [[1, 1], [2, 11], [2, 23], [4, 29], [5, 3], [5, 4], [5, 5], [8, 11], [11, 3], [11, 23]].forEach(([m, d]) => s.add(k(m, d)));
+  s.add(k(1, nthMon(1, 2))); s.add(k(7, nthMon(7, 3))); s.add(k(9, nthMon(9, 3))); s.add(k(10, nthMon(10, 2)));
+  s.add(k(3, eq(20.8431))); s.add(k(9, eq(23.2488)));
+  // 国民の休日：祝日と祝日にはさまれた日（日曜でなければ）
+  [...s].forEach(x => { const d = parse(x), d1 = addDays(d, 1); if (s.has(ymd(addDays(d, 2))) && !s.has(ymd(d1)) && d1.getDay() !== 0) s.add(ymd(d1)); });
+  // 振替休日：日曜の祝日 → そのあとの、祝日でない最初の日
+  [...s].sort().forEach(x => { const d = parse(x); if (d.getDay() === 0) { let n = addDays(d, 1); while (s.has(ymd(n))) n = addDays(n, 1); s.add(ymd(n)); } });
+  HOLI.set(y, s);
+  return s;
+}
+const redDay = d => d.getDay() === 0 || holidays(d.getFullYear()).has(ymd(d)); // 日曜・祝日
+const ymJp = s => { const [y, m] = String(s || "").split("-").map(Number); return y && m ? `${y}年${m}月` : ""; };
+const surname = n => String(n || "").split(/[\s　]+/)[0];
+const plate4 = v => String(v.plateNum || "").replace(/\D/g, "").slice(-4) || String(v.plateNum || "");
+const driverOf = v => v.driver || v.owner || "";
+// 点検表の確認の欄。所長・所長代理・実施者は、車に月ごとに残す（seals）。チェック者は、その月の点検を全部確認したら入る
+// 実施者は、印がなければ月末の点検をした人
+const SEALS = [["boss", "所長"], ["deputy", "所長代理"], ["checker", "チェック者"], ["doer", "実施者"]];
+// 点検表に出すもの（画面と印刷で同じ）
+function sheetData(v, ym, recs) {
+  const [y, m] = ym.split("-").map(Number), nd = new Date(y, m, 0).getDate();
+  const days = Array.from({ length: nd }, (_, i) => { const d = new Date(y, m - 1, i + 1); return { n: i + 1, key: ymd(d), red: redDay(d) }; });
+  const mine = recs.filter(c => c.vehicleId === v.id), month = mine.filter(c => ymOf(c.date) === ym);
+  const byDay = new Map(month.map(c => [c.date, c]));
+  const mon = month.find(c => c.monthly) || null, prev = prevMeter(v.id, ym, mine);
+  const run = mon && mon.meter != null && prev ? mon.meter - prev.meter : null;
+  const used = new Set(month.flatMap(c => Object.keys(c.res || {})));
+  const items = allCheckItems().filter(x => !x.del || used.has(x.id));
+  const kind = x => (x.air && !v.airTank ? "na" : x.freq === "monthly" ? "mon" : "day");
+  // 違和感・気付いたこと（問題ありの一言）と、修理依頼
+  const notes = month.filter(c => ngOf(c)).sort((a, b) => (a.date > b.date ? 1 : -1)).flatMap(c => ngText(c).map(t => {
+    const r = c.repairId && S.repairs.find(x => x.id === c.repairId);
+    return [`${fmt(c.date)}${c.monthly ? "（月末）" : ""}　${t}（${c.by || ""}）`, c.repairId ? `修理依頼済み${r && REPAIR_TAG[r.status] ? `（${REPAIR_TAG[r.status][1]}）` : ""}` : ""];
+  }));
+  const wait = month.filter(c => !c.confirmed), saved = ((v.seals || {})[ym]) || {};
+  const seal = {
+    boss: (saved.boss && saved.boss.by) || "", deputy: (saved.deputy && saved.deputy.by) || "",
+    checker: month.length && !wait.length ? mostOf(month.map(c => c.confirmedBy)) : "",
+    doer: (saved.doer && saved.doer.by) || (mon && mon.by) || "",
+  };
+  return { y, m, nd, days, byDay, mon, prev, run, items, kind, notes, month, wait, seal, saved, driver: driverOf(v) || mostOf(month.map(c => c.by)) };
+}
+// 印刷（紙と同じ形・A4横）。月末だけの行はうすい灰色、エアタンクなしで対象外の行はうすい斜線
+function checkSheet(v, ym, recs) {
+  const D = sheetData(v, ym, recs), nd = D.nd;
+  const mark = r => (r === "ok" ? `<span class="ck-v">✓</span>` : r === "ng" ? `<span class="ck-x">✕</span>` : "");
+  let rows = "";
+  D.items.forEach((x, k) => {
+    const kd = D.kind(x);
+    let catTd = "";
+    if (k === 0 || D.items[k - 1].cat !== x.cat) { let span = 1; while (D.items[k + span] && D.items[k + span].cat === x.cat) span++; catTd = `<td class="ck-catc" rowspan="${span}">${esc(x.cat)}</td>`; }
+    let cells;
+    if (kd === "na") cells = `<td class="ck-na" colspan="${nd + 1}"></td>`;
+    else if (kd === "day") cells = D.days.map(d => { const c = D.byDay.get(d.key); return `<td class="ck-c${d.red ? " red" : ""}">${c ? mark(c.res && c.res[x.id]) : ""}</td>`; }).join("") + `<td class="ck-c ck-end">${D.mon ? mark(D.mon.res && D.mon.res[x.id]) : ""}</td>`;
+    else {
+      const first = k === 0 || D.kind(D.items[k - 1]) !== "mon";
+      let span = 1; if (first) while (D.items[k + span] && D.kind(D.items[k + span]) === "mon") span++;
+      cells = (first ? `<td class="ck-mrun" colspan="${nd}" rowspan="${span}"></td>` : "") + `<td class="ck-c ck-end">${D.mon ? mark(D.mon.res && D.mon.res[x.id]) : ""}</td>`;
+    }
+    rows += `<tr>${catTd}<td class="ck-item">${esc(x.name)}${x.air ? "（エアタンク有のみ）" : ""}${x.del ? "（今は使っていない項目）" : ""}</td>${cells}</tr>`;
+  });
+  const dayHd = D.days.map(d => `<th class="ck-d${d.red ? " red" : ""}">${d.n}</th>`).join("");
+  const notes = D.notes.map(([a, b]) => `<tr><td>${esc(a)}</td><td>${esc(b)}</td></tr>`);
+  while (notes.length < 4) notes.push(`<tr><td></td><td></td></tr>`);
+  // チェック者押印（日ごと＋月末点検）
+  const box = (lb, c, off) => `<td class="${off ? "off" : ""}"><div class="ck-bd">${lb}</div><div class="ck-bs">${c && c.confirmed ? stamp(c.confirmedBy) : ""}</div></td>`;
+  const half = Math.ceil((nd + 1) / 2), cellsAll = [...D.days.map(d => box(d.n, D.byDay.get(d.key), d.red)), box("月末点検", D.mon, false)];
+  const stampRows = [cellsAll.slice(0, half), cellsAll.slice(half)].map(r => `<tr>${r.join("")}${"<td class=\"ck-blank\"></td>".repeat(half - r.length)}</tr>`).join("");
+  const ymCells = s => { const [a, b] = String(s || "").split("-"); return `<td>${esc(a || "")}</td><td class="u">年</td><td>${b ? Number(b) : ""}</td><td class="u">月</td>`; };
+  return `<div class="ck-sheet">
+    <div class="ck-top">
+      <div class="ck-tl"><div class="ck-title">日常・1ヶ月点検リスト</div>
+        <table class="ck-hd ck-oil"><tr><th>前回のオイル交換日</th>${ymCells(v.oilAt)}</tr><tr><th>前回のノーマルタイヤ交換日</th>${ymCells(v.tireAt)}</tr><tr><th>前回のスタッドレスタイヤ交換日</th>${ymCells(v.studAt)}</tr></table></div>
+      <table class="ck-hd"><tr><th>運転者</th><td>${esc(D.driver)}</td></tr><tr><th>車番</th><td>${esc(v.plateNum)}</td></tr></table>
+      <table class="ck-hd"><tr><th>月間走行距離</th><td class="num">${D.run != null ? fmtKm(D.run) : ""}</td><td class="u">km</td></tr><tr><th>総走行距離</th><td class="num">${D.mon && D.mon.meter != null ? fmtKm(D.mon.meter) : ""}</td><td class="u">km</td></tr></table>
+      <div class="ck-tl"><table class="ck-hd"><tr><th>車検日</th>${ymCells(ymOf(v.shakenDate || ""))}</tr><tr><th>点検年月</th><td class="hl">${D.y}</td><td class="u hl">年</td><td class="hl">${D.m}</td><td class="u hl">月</td></tr></table>
+        <div class="ck-car">${esc(v.plateArea)} ${esc(v.plateClass)} ${esc(v.plateKana)} ${esc(v.plateNum)}　${esc(v.kind)}</div></div>
+      <table class="ck-seal"><tr>${SEALS.map(([, l]) => `<th>${l}</th>`).join("")}</tr><tr>${SEALS.map(([k]) => `<td>${stamp(D.seal[k])}</td>`).join("")}</tr></table>
+    </div>
+    <table class="ck-tbl"><thead><tr><th class="ck-catc">分類</th><th class="ck-item">項目</th>${dayHd}<th class="ck-d ck-end">月末</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="ck-note">※問題なければ ✓、問題ありなら ✕。うすい灰色は月末だけ確認する項目、斜線はこの車では対象外（エアタンクなし）。赤い日は日曜・祝日。</p>
+    <div class="ck-bottom">
+      <table class="ck-notes"><colgroup><col style="width:62%"><col></colgroup><thead><tr><th colspan="2">違和感・気付いたこと等</th></tr><tr><th>気付いた日時・内容</th><th>修理依頼先・部品交換等</th></tr></thead><tbody>${notes.join("")}</tbody></table>
+      <table class="ck-stamps"><colgroup>${`<col style="width:${(100 / half).toFixed(3)}%">`.repeat(half)}</colgroup><thead><tr><th colspan="${half}">チェック者押印</th></tr></thead><tbody>${stampRows}</tbody></table>
+    </div>
+  </div>`;
+}
+// 画面の点検表（大きい字。見出しに車の情報、右に確認の欄。まだのところは「確認する」）
+const bigStamp = n => `<span class="cks-stamp" title="${esc(n)}">${esc(stampName(n))}</span>`;
+const miniStamp = n => `<span class="cks-mini" title="${esc(n)}の確認">${esc(stampName(n).slice(0, 1))}</span>`;
+function checkSheetScreen(v, ym, recs) {
+  const D = sheetData(v, ym, recs), t = ymd(today());
+  const facts = [
+    ["運転者", D.driver ? esc(D.driver) : `<span class="m">—</span>`],
+    ["車番", `${esc(v.plateNum)}<small>${esc(v.kind)}</small>`],
+    ["月間走行距離", D.run != null ? `${fmtKm(D.run)} km` : `<span class="m">月末に入ります</span>`],
+    ["総走行距離", D.mon && D.mon.meter != null ? `${fmtKm(D.mon.meter)} km` : D.prev ? `${fmtKm(D.prev.meter)} km<span class="m">（${ymJp(ymOf(D.prev.date))}末）</span>` : `<span class="m">—</span>`],
+    ["車検", ymJp(v.shakenDate) || `<span class="m">—</span>`],
+    ["前回のオイル交換", ymJp(v.oilAt) || `<span class="m">—</span>`],
+    ["前回のノーマルタイヤ交換", ymJp(v.tireAt) || `<span class="m">—</span>`],
+    ["前回のスタッドレス交換", ymJp(v.studAt) || `<span class="m">—</span>`],
+  ];
+  const sealBox = ([k, l]) => {
+    const n = D.seal[k];
+    let body;
+    if (n) body = k === "checker" || !D.saved[k] ? bigStamp(n) // 点検の確認・月末の点検から入った印
+      : `<button type="button" class="cks-undo" data-act="ckSeal" data-val="${k}" data-id="off" title="押すと、この印を取り消せます">${bigStamp(n)}</button>`;
+    else if (k === "checker" && !D.month.length) body = `<span class="m">点検なし</span>`;
+    else body = `${k === "checker" ? `<span class="m">確認待ち ${D.wait.length}日</span>` : ""}<button type="button" class="btn ghost small" data-act="ckSeal" data-val="${k}">確認する</button>`;
+    return `<div><span class="sl">${l}</span><span class="sv">${body}</span></div>`;
+  };
+  const mark = (r, red, td, end) => `<td class="cd${r === "ok" ? " okv" : r === "ng" ? " ngv" : ""}${red ? " red" : ""}${td ? " td" : ""}${end ? " ce" : ""}">${r === "ok" ? "✓" : r === "ng" ? "✕" : ""}</td>`;
+  let rows = "";
+  D.items.forEach((x, k) => {
+    const kd = D.kind(x), first = k === 0 || D.items[k - 1].cat !== x.cat;
+    let catTd = "";
+    if (first) { let span = 1; while (D.items[k + span] && D.items[k + span].cat === x.cat) span++; catTd = `<td class="c1" rowspan="${span}">${esc(x.cat)}</td>`; }
+    const endR = D.mon && D.mon.res && D.mon.res[x.id];
+    const cells = kd === "na" ? `<td class="na" colspan="${D.nd + 1}"></td>`
+      : kd === "mon" ? `<td class="mon" colspan="${D.nd}"></td>${mark(endR, false, false, true)}`
+      : D.days.map(d => { const c = D.byDay.get(d.key); return mark(c && c.res && c.res[x.id], d.red, d.key === t, false); }).join("") + mark(endR, false, false, true);
+    rows += `<tr class="${first ? "gtop" : ""}${kd === "na" ? " off" : ""}">${catTd}<td class="c2">${esc(x.name)}${x.air ? "<small>（エアタンク有のみ）</small>" : ""}${x.del ? "<small>（今は使っていない項目）</small>" : ""}</td>${cells}</tr>`;
+  });
+  const stp = `<tr class="stp"><td class="c1" colspan="2">チェック者の確認</td>${D.days.map(d => { const c = D.byDay.get(d.key); return `<td class="cd${d.red ? " red" : ""}">${c && c.confirmed ? miniStamp(c.confirmedBy) : ""}</td>`; }).join("")}<td class="cd ce">${D.mon && D.mon.confirmed ? miniStamp(D.mon.confirmedBy) : ""}</td></tr>`;
+  return `<div class="panel cks">
+    <div class="cks-head"><h2>日常・1ヶ月点検リスト　${D.y}年${D.m}月</h2><span class="m">${esc(v.plateArea)} ${esc(v.plateClass)} ${esc(v.plateKana)} ${esc(v.plateNum)}</span></div>
+    <div class="cks-top"><div class="cks-facts">${facts.map(([k, x]) => `<div><span>${k}</span><b>${x}</b></div>`).join("")}</div><div class="cks-seals">${SEALS.map(sealBox).join("")}</div></div>
+    <div class="cks-scroll"><table class="cks-t"><thead><tr><th class="c1">分類</th><th class="c2">項目</th>${D.days.map(d => `<th class="cd${d.red ? " red" : ""}${d.key === t ? " td" : ""}">${d.n}</th>`).join("")}<th class="cd ce">月末</th></tr></thead>
+      <tbody>${rows}${stp}</tbody></table></div>
+    <div class="cks-legend"><span><b class="okc">✓</b>問題なし</span><span><b class="ngc">✕</b>問題あり</span><span><i class="mon"></i>月末だけ確認する項目</span><span><i class="na"></i>この車は対象外（エアタンクなし）</span><span><b class="redc">赤い日</b>日曜・祝日</span></div>
+    <div class="cks-notes"><div class="nh">違和感・気付いたこと（スマホの「問題あり」から入ります）</div><div class="nh">修理依頼先・部品交換など</div>
+      ${D.notes.length ? D.notes.map(([a, b]) => `<div>${esc(a)}</div><div>${esc(b) || "—"}</div>`).join("") : `<div>なし</div><div>—</div>`}</div>
+  </div>`;
+}
+function checkPage() {
+  const cars = ckCars();
+  if (!cars.length) return `<div class="panel"><div class="empty">まだ車が登録されていません</div></div>`;
+  if (!cars.some(v => v.id === ckUi.vid)) ckUi.vid = cars[0].id;
+  const v = byId(ckUi.vid), [y, m] = ckUi.ym.split("-").map(Number), thisYm = ymOf(ymd(today()));
+  const recs = S.checkErr ? null : ckRecs(ckUi.ym);
+  const names = [...new Set([...activeMembers().map(x => x.name), ...(checker() ? [checker()] : [])])].sort(byLen);
+  return `<div class="ck-page">
+    <div class="ck-tools">
+      <div class="ck-mnav"><button type="button" class="pcal-nav" data-act="ckMonth" data-val="-1" aria-label="前の月">‹</button><b>${y}年${m}月</b><button type="button" class="pcal-nav" data-act="ckMonth" data-val="1"${ckUi.ym >= thisYm ? " disabled" : ""} aria-label="次の月">›</button></div>
+      <label class="ck-who">確認する人<select data-ckwho aria-label="確認する人">${checker() ? "" : `<option value="">選んでください</option>`}${names.map(n => `<option${n === checker() ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+      <span class="sp"></span>
+      <button type="button" class="btn ghost small" data-act="ckPrintAll"${recs ? "" : " disabled"}>この月の全部の車を印刷</button>
+      <button type="button" class="btn primary small" data-act="ckPrint"${recs ? "" : " disabled"}>印刷する（A4横）</button>
+    </div>
+    <div class="ck-chips" role="group" aria-label="車">${cars.map(c => `<button type="button" class="ck-chip" data-act="ckCar" data-id="${c.id}" aria-pressed="${c.id === v.id}">${esc(plate4(c))}${driverOf(c) ? `<span>${esc(surname(driverOf(c)))}</span>` : ""}</button>`).join("")}</div>
+    ${S.checkErr ? `<div class="errbar">${esc(S.checkErr)}</div>` : !recs || !S.checksLoaded ? `<div class="loading">読み込み中…</div>` : checkSheetScreen(v, ckUi.ym, recs)}
+  </div>`;
+}
+// 確認の欄の「確認する」：所長・所長代理・実施者は「確認する人」の印を入れる（押すと取り消し）。チェック者は、その月の点検をまとめて確認
+function setSeal(role, off) {
+  const v = byId(ckUi.vid); if (!v) return;
+  const ym = ckUi.ym, label = (SEALS.find(s => s[0] === role) || [])[1]; if (!label) return;
+  if (off) {
+    if (!confirm(`${label}の印を取り消しますか？`)) return;
+    updateDoc(doc(db, "vehicles", v.id), { [`seals.${ym}.${role}`]: deleteField(), updatedAt: serverTimestamp() })
+      .catch(e => { console.error(e); toast("取り消せませんでした。もう一度お試しください", "err"); });
+    toast(`${label}の印を取り消しました`);
+    return;
+  }
+  const who = checker();
+  if (!who) { toast("上の「確認する人」を選んでください"); return; }
+  if (role === "checker") {
+    const wait = (ckRecs(ym) || []).filter(c => c.vehicleId === v.id && ymOf(c.date) === ym && !c.confirmed);
+    if (!wait.length) return;
+    const ng = wait.filter(c => ngOf(c)).length;
+    if (!confirm(`${v.kind}の${Number(ym.slice(5))}月の点検 ${wait.length}日分を、確認済みにしますか？${ng ? `\n（問題ありの日が ${ng}日あります。修理を頼むときは「今日の状況」の点検の欄からどうぞ）` : ""}\n\n確認する人：${who}`)) return;
+    confirmChecks(wait.map(c => c.id));
+    return;
+  }
+  updateDoc(doc(db, "vehicles", v.id), { [`seals.${ym}.${role}`]: { by: who, at: serverTimestamp() }, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("印を入れられませんでした。もう一度お試しください", "err"); });
+  toast(`${label}の欄に「${who}」の印を入れました`);
+}
+// 印刷：印刷用の場所に表を入れて、ほかを隠して印刷する（A4横・1台1枚）
+function printSheets(cars) {
+  const recs = ckRecs(ckUi.ym); if (!recs) return;
+  let el = $("ckprint");
+  if (!el) { el = document.createElement("div"); el.id = "ckprint"; document.body.appendChild(el); }
+  el.innerHTML = cars.map(v => `<div class="ck-sheet-page">${checkSheet(v, ckUi.ym, recs)}</div>`).join("");
+  document.body.classList.add("ck-printing");
+  const done = () => { document.body.classList.remove("ck-printing"); el.innerHTML = ""; removeEventListener("afterprint", done); };
+  addEventListener("afterprint", done);
+  print();
+}
+
+/* ---------- PC：設定 → 点検（すぐ保存） ---------- */
+// 上から：点検表をつかう（ON/OFF）・車（エアタンク あり／なし と点検の数）・点検の項目。OFF のときはスイッチだけ
+function renderCheckSettings() {
+  const el = $("ckset"); if (!el) return;
+  const on = checkOn(), items = checkItems(), cats = [...new Set(items.map(x => x.cat))];
+  const airNames = items.filter(x => x.air).map(x => x.name).join("・");
+  const box = el.querySelector(".ck-items"), keep = box ? box.scrollTop : 0; // 項目の一覧の、見ていた位置
+  el.innerHTML = `<label class="nsw-row ck-onrow"><span>点検表をつかう<small>OFF にすると、スマホの「点検」と PC の「点検表」が消えます</small></span>
+      <input type="checkbox" class="switch-in" id="ck-on"${on ? " checked" : ""} aria-label="点検表をつかう"></label>
+    ${!on ? "" : `
+    <div class="ck-sec"><div class="ck-sh"><b>車</b><span>エアタンクが「なし」の車は、エアの点検が出ません（3tまでの車は、たいてい「なし」）</span></div>
+      <div id="ckcars"></div></div>
+    <div class="field ck-sec"><label>点検の項目（${items.length}こ）</label>
+      <div class="hint">「月末だけ」の項目は、月末の点検のときだけ出ます。「エアタンク」に印のある項目は、上の車の一覧（または車の修正画面）で「あり」にした車だけに出ます${airNames ? `（今は：${esc(airNames)}）` : ""}。変えると、すぐ保存されます</div>
+      <div class="ck-items"><table class="ck-itbl"><thead><tr><th>分類</th><th>項目</th><th>いつ</th><th>エアタンク</th><th></th></tr></thead><tbody>
+        ${items.map(x => `<tr><td class="c">${esc(x.cat)}</td><td>${esc(x.name)}</td>
+          <td><select data-ckfreq="${x.id}" aria-label="${esc(x.name)} いつ"><option value="daily"${x.freq !== "monthly" ? " selected" : ""}>毎日</option><option value="monthly"${x.freq === "monthly" ? " selected" : ""}>月末だけ</option></select></td>
+          <td class="a"><label><input type="checkbox" data-ckair="${x.id}"${x.air ? " checked" : ""}>ありの車だけ</label></td>
+          <td><button type="button" class="btn ghost small" data-act="ckDel" data-id="${x.id}">消す</button></td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="ck-add">
+        <input id="ckadd-cat" list="ckcats" placeholder="分類（例：ブレーキ）" maxlength="20" autocomplete="off" aria-label="足す項目の分類"><datalist id="ckcats">${cats.map(c => `<option value="${esc(c)}">`).join("")}</datalist>
+        <input id="ckadd-name" placeholder="項目（例：荷台のあおりの留め金）" maxlength="60" autocomplete="off" aria-label="足す項目">
+        <select id="ckadd-freq" aria-label="いつ"><option value="daily">毎日</option><option value="monthly">月末だけ</option></select>
+        <label class="a"><input type="checkbox" id="ckadd-air">エアタンクありの車だけ</label>
+        <button type="button" class="btn ghost small" data-act="ckAdd">＋ 足す</button>
+      </div>
+      <p style="margin:10px 0 0"><button type="button" class="linkbtn" data-act="ckReset">最初の項目（24こ）に戻す</button></p>
+    </div>`}`;
+  const nb = el.querySelector(".ck-items"); if (nb) nb.scrollTop = keep;
+  renderCheckCars();
+}
+// 設定 → 点検の「車」：1台1行。車番（下4けた）・車種・いつも乗る人・エアタンク（あり／なし）・点検の数
+// 車が変わったとき（エアタンクを切りかえたときも）は、ここだけ描き直す（下の項目の入力欄はそのまま）
+function renderCheckCars() {
+  const el = $("ckcars"); if (!el) return;
+  const cars = ckCars();
+  const count = v => { const it = checkItems().filter(x => !x.air || v.airTank); return `毎日 ${it.filter(x => x.freq !== "monthly").length}こ・月末 ${it.filter(x => x.freq === "monthly").length}こ`; };
+  el.innerHTML = !cars.length ? `<div class="empty">まだ車が登録されていません</div>` : `<div class="ck-cars"><table class="ck-ctbl"><thead><tr><th>車番</th><th>車種</th><th>いつも乗る人</th><th>エアタンク</th><th>点検の数</th></tr></thead><tbody>
+    ${cars.map(v => `<tr><td><span class="ck-no">${esc(plate4(v))}</span></td><td>${esc(v.kind)}</td><td>${driverOf(v) ? `${esc(driverOf(v))}さん` : `<span class="m">—</span>`}</td>
+      <td><span class="ck-air" role="group" aria-label="${esc(plate4(v))}のエアタンク">${[["1", "あり"], ["0", "なし"]].map(([k, l]) =>
+        `<button type="button" data-act="ckAir" data-id="${v.id}" data-val="${k}" aria-pressed="${(v.airTank ? "1" : "0") === k}">${l}</button>`).join("")}</span></td>
+      <td class="n">${count(v)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+// エアタンクの あり／なし（押したらすぐ保存。車の修正画面の欄と同じもの）
+function setAirTank(id, on) {
+  const v = byId(id); if (!v || !!v.airTank === on) return;
+  updateDoc(doc(db, "vehicles", v.id), { airTank: on, updatedAt: serverTimestamp() })
+    .catch(e => { console.error(e); toast("保存できませんでした。もう一度お試しください", "err"); });
+  toast(`${plate4(v)}（${v.kind}）をエアタンク「${on ? "あり" : "なし"}」にしました`);
+}
+function saveCheckItems(list, msg) {
+  setDoc(doc(db, "settings", "app"), { checkItems: list, updatedAt: serverTimestamp() }, { merge: true })
+    .catch(e => { console.error(e); toast("保存できませんでした。もう一度お試しください", "err"); });
+  if (msg) toast(msg);
+}
+const editItems = f => saveCheckItems(allCheckItems().map(x => ({ ...x })).map(f));
+function setCheckOn(on) {
+  if (!on && !confirm("点検表をオフにしますか？\n\nスマホの点検とPCの点検表が、全員の画面から消えます（記録は消えません。オンに戻すとまた出ます）")) { renderCheckSettings(); return; }
+  setDoc(doc(db, "settings", "app"), { checkOn: on, updatedAt: serverTimestamp() }, { merge: true })
+    .catch(e => { console.error(e); toast("保存できませんでした。もう一度お試しください", "err"); });
+  toast(on ? "点検表をオンにしました" : "点検表をオフにしました");
+}
+function addCheckItem() {
+  const cat = $("ckadd-cat").value.trim(), name = $("ckadd-name").value.trim();
+  if (!cat || !name) { toast("分類と項目を入れてください"); return; }
+  if (checkItems().some(x => x.cat === cat && x.name === name)) { toast("同じ項目がもうあります"); return; }
+  const list = allCheckItems().map(x => ({ ...x }));
+  const it = { id: `c${Date.now().toString(36)}`, cat, name, freq: $("ckadd-freq").value === "monthly" ? "monthly" : "daily", air: $("ckadd-air").checked };
+  // 同じ分類の最後のうしろに入れる（なければいちばん下）
+  let at = -1; list.forEach((x, k) => { if (!x.del && x.cat === cat) at = k; });
+  list.splice(at < 0 ? list.length : at + 1, 0, it);
+  saveCheckItems(list, `「${name}」を足しました`);
+}
+function delCheckItem(id) {
+  const x = checkItems().find(y => y.id === id); if (!x) return;
+  if (!confirm(`「${x.name}」を点検の項目から消しますか？\n\nこれまでの記録は残ります（前の月の点検表には出ます）`)) return;
+  editItems(y => (y.id === id ? { ...y, del: true } : y));
+  toast(`「${x.name}」を消しました`);
+}
+function resetCheckItems() {
+  if (!confirm("点検の項目を、最初の24こに戻しますか？\n\n足した項目は消えます（これまでの記録は残ります）")) return;
+  const keep = allCheckItems().filter(x => !CHECK_DEFAULT.some(d => d.id === x.id)).map(x => ({ ...x, del: true })); // 足した項目は消した扱いで残す
+  saveCheckItems([...CHECK_DEFAULT.map(x => ({ ...x })), ...keep], "最初の24こに戻しました");
+}
+
+/* ---------- サンプル投入（車12台・名簿8人。日付は今日を基準にずらす） ---------- */
+// ナンバー・車のあだ名・置き場所・現場・人の名前は、すべて作りもの（実在の会社・現場・人とは関係ない）
+const SAMPLE_LOTS = ["本社", "東駐車場", "資材置き場"];
+const SAMPLE_SITES = ["さくら工場 定期修理", "駅前ビル 新築", "みどり台 マンション新築", "中央病院 改修", "港町倉庫 解体"];
+//                 名前          区分        所属
+const SAMPLE_MEMBERS = [
+  ["山田 太郎", "自社", ""], ["佐藤 花子", "自社", ""], ["鈴木 一郎", "自社", ""], ["高橋 健太", "自社", ""],
+  ["田中 誠", "自社", ""], ["伊藤 美咲", "自社", ""], ["中村 大輔", "常駐協力", "あおば設備"], ["小林 翔", "外注協力", "みなと運輸"],
+];
+async function seed() {
+  if (S.vehicles.length) return;
+  // 駐車場・現場の候補：まだ設定していない（最初の見本のまま）ならサンプル用にする。自分で設定していれば、その駐車場に車を置く
+  const st = S.settings, same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+  const own = (st.lots || []).filter(Boolean).slice(0, LOT_MAX);
+  const fresh = !S.settingsExists || !own.length || (same(st.lots, DEFAULT_SETTINGS.lots) && same(st.sites, DEFAULT_SETTINGS.sites));
+  const lots = fresh ? SAMPLE_LOTS : own;
+  if (!confirm(`試しに使うためのサンプル（作りものの車12台・名簿${SAMPLE_MEMBERS.length}人と、予約・修理・車検・点検の例）を入れます。${fresh ? "\n駐車場と現場の候補も、サンプル用のものにします。" : ""}\nあとで「サンプルデータを消す」で消せます。\n\n入れますか？`)) return;
+  const t = today(), D = n => ymd(addDays(t, n)), at = n => Timestamp.fromDate(addDays(t, n)), base = Date.now();
+  const P = SAMPLE_MEMBERS.map(m => m[0]);
+  const b = writeBatch(db);
+  //        地域   分類   かな  番号     車のあだ名                 種類       必要な免許   車検(今日から) 置き場所(lots の番号)
+  const cars = [
+    ["品川", "400", "あ", "21-07", "2tダンプ（1号）", "トラック", "準中型", 140, 2],
+    ["品川", "100", "い", "38-52", "3t平ボディ（クレーン付き）", "トラック", "準中型", 63, 2],
+    ["練馬", "100", "う", "46-19", "4t平ボディ", "トラック", "中型", 205, 2],
+    ["品川", "480", "え", "50-23", "軽トラ（2号）", "トラック", "普通", 26, 1],
+    ["多摩", "400", "か", "62-48", "2tパワーゲート車", "トラック", "準中型5t", 118, 1],
+    ["品川", "300", "き", "73-05", "ワンボックス（10人乗り）", "バン", "普通", 9, 0],
+    ["練馬", "400", "く", "81-36", "ワンボックス（資材用）", "バン", "普通", 172, 1],
+    ["品川", "400", "け", "19-64", "ライトバン", "バン", "普通", 4, 0],
+    ["多摩", "480", "こ", "27-90", "軽バン", "バン", "普通", 241, 1],
+    ["品川", "300", "さ", "33-71", "ミニバン（7人乗り）", "普通車", "普通", 300, 0],
+    ["練馬", "300", "す", "54-80", "セダン（営業用）", "普通車", "普通", 17, 0],
+    ["品川", "580", "せ", "68-12", "軽自動車（事務所）", "普通車", "普通", 330, 0],
+  ];
+  const ins = doc(collection(db, "inspections")), iv = 7; // 車検中にする車（ライトバン。2日前に出して、3日後に戻る予定）
+  // 点検表に出すこと：[いつも乗る人（名簿の番号）, 前回のオイル交換, ノーマルタイヤ交換, スタッドレス交換（何か月前）]
+  const CKV = [[0, 3, 6, 10], [4, 5, 7, null], [6, 2, 18, 10], [3, 4, null, null], [7, 1, 9, null], [2, 2, 5, 10],
+    [null, 6, 13, null], [null, 8, null, null], [null, 4, null, null], [5, 3, 6, 10], [1, 2, 7, 10], [null, 5, null, null]];
+  const nowYm = ymOf(ymd(t)), ago = n => (n == null ? null : ymAdd(nowYm, -n));
+  const ids = cars.map(([plateArea, plateClass, plateKana, plateNum, kind, type, license, sh, li], i) => {
+    const ref = doc(collection(db, "vehicles")), lot = lots[li % lots.length], [dr, oil, tire, stud] = CKV[i];
+    b.set(ref, {
+      plateArea, plateClass, plateKana, plateNum, kind, type, license, shakenDate: D(sh), photoUrl: null,
+      homeLot: lot, currentLot: lot, status: "free", retired: false, sample: true, airTank: i === 2, // エアタンクがあるのは 4t平ボディ だけ
+      driver: dr == null ? null : P[dr], oilAt: ago(oil), tireAt: ago(tire), studAt: ago(stud),
+      ...(i === 0 ? { seals: { [ymAdd(nowYm, -1)]: { boss: { by: P[3], at: at(-8) } } } } : {}), // 2tダンプの先月の点検表に、所長の印
+      ...(i === iv ? { inspection: { id: ins.id, from: D(-2), until: D(3) } } : {}),
+      createdAt: Timestamp.fromMillis(base + i), updatedAt: serverTimestamp(),
+    });
+    return ref.id;
+  });
+  const lotOfCar = i => lots[cars[i][8] % lots.length];
+  // 予約：今日使っている車（4台）と、この先の予約（7件）。[車, 使う人, 現場, 何日後から, 何日後まで]
+  [
+    [0, 0, 0, -3, 4], [5, 2, 1, -1, 1], [10, 1, 3, 0, 0], [2, 6, 2, -2, 6],
+    [3, 3, 4, 2, 3], [9, 5, 3, 4, 4], [4, 7, 4, 5, 9], [0, 4, 0, 8, 12],
+    [6, 0, 2, 11, 15], [11, 1, 1, 13, 13], [2, 6, 0, 19, 23],
+  ].forEach(([i, p, s, f, to]) => b.set(doc(collection(db, "reservations")), {
+    vehicleId: ids[i], who: P[p], site: SAMPLE_SITES[s], from: D(f), to: D(to), createdBy: P[p],
+    returnedAt: null, returnedLot: null, sample: true, createdAt: serverTimestamp(),
+  }));
+  // 修理：修理中・まだ見ていない依頼・終わったもの。[車, 症状, メモ, 出した人, 状態, 何日前に出したか]
+  [
+    [1, ["異音がする"], "クレーンを回すと警報のブザーが鳴りやまない", 4, "in_repair", -3],
+    [6, ["その他"], "左のスライドドアが重く、閉まりにくい", 5, "open", -1],
+    [0, ["タイヤ"], "左後ろのタイヤの空気が減りやすい", 3, "done", -20],
+  ].forEach(([i, symptoms, memo, p, st, ago]) => b.set(doc(collection(db, "repairs")), {
+    vehicleId: ids[i], symptoms, memo, photoUrls: [], reportedBy: P[p], status: st, sample: true,
+    createdAt: at(ago), doneAt: st === "done" ? at(ago + 2) : null,
+    ...(st === "in_repair" ? { inRepairAt: at(ago + 1), prev: { status: "open", currentLot: lotOfCar(i) } } : {}),
+  }));
+  // 車検の記録（車検中の車の分）
+  b.set(ins, {
+    vehicleId: ids[iv], outDate: D(-2), expectedBack: D(3), backDate: null,
+    oldShakenDate: D(cars[iv][7]), newShakenDate: null, outBy: P[5], backBy: null, returnedLot: null,
+    outAt: at(-2), backAt: null, prev: { currentLot: lotOfCar(iv), availDate: null, shopWish: null }, sample: true,
+  });
+  // 名簿：まだいない名前だけ足す（前にサンプルを消したとき隠した人は、表示に戻す）
+  const have = new Map(S.members.map(m => [m.name, m]));
+  SAMPLE_MEMBERS.forEach(([name, kubun, shozoku]) => {
+    const m = have.get(name);
+    if (!m) b.set(doc(collection(db, "members")), { name, kubun, shozoku, active: true, source: "sample", sample: true, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    else if (m.sample && m.active === false) b.update(doc(db, "members", m.id), { active: true, updatedAt: serverTimestamp() });
+  });
+  if (fresh) b.set(doc(db, "settings", "app"), {
+    ...(S.settingsExists ? {} : { shakenAlertDays: DEFAULT_SETTINGS.shakenAlertDays }),
+    lots: SAMPLE_LOTS, sites: SAMPLE_SITES, updatedAt: serverTimestamp(),
+  }, { merge: true });
+  // 点検の記録：使っている車の毎日の点検（問題ありを1台）と、先月の月末点検（メーター）。確認した人（印）は伊藤 美咲
+  const ckDocs = new Map(), V = i => ({ id: ids[i], airTank: i === 2 });
+  const putCheck = (i, date, p, { monthly = false, meter = null, ng = {}, conf = true } = {}) => {
+    const res = {}; itemsFor(V(i), monthly).forEach(x => { res[x.id] = ng[x.id] ? "ng" : "ok"; });
+    const when = parse(date); when.setHours(8, 10);
+    ckDocs.set(checkKey(ids[i], date), {
+      vehicleId: ids[i], date, monthly, res, memo: ng, ng: Object.keys(ng).length, meter, by: P[p], at: Timestamp.fromDate(when),
+      confirmed: conf, confirmedBy: conf ? P[5] : null, confirmedAt: conf ? Timestamp.fromDate(addDays(when, 1)) : null, repairId: null, sample: true,
+    });
+  };
+  for (let n = -12; n <= -1; n++) if (addDays(t, n).getDay() !== 0) putCheck(0, D(n), n >= -3 ? 0 : 4, { conf: n < -1 }); // 2tダンプ：毎日（日曜は休み）
+  putCheck(2, D(-2), 6); putCheck(2, D(-1), 6, { ng: { i07: "左後ろのタイヤの空気が少ない" }, conf: false }); // 4t平ボディ：きのう問題あり
+  putCheck(5, D(-1), 2, { conf: false }); putCheck(5, D(0), 2, { conf: false }); putCheck(10, D(0), 1, { conf: false });
+  let lastM = new Date(t.getFullYear(), t.getMonth(), 0); if (lastM.getDay() === 0) lastM = addDays(lastM, -1); // 先月の最後の日（日曜なら土曜）
+  [[0, 0, 48210], [2, 6, 132560], [5, 2, 61034], [9, 5, 15402], [10, 1, 23880], [4, 7, 87215]].forEach(([i, p, km]) => putCheck(i, ymd(lastM), p, { monthly: true, meter: km }));
+  try { await b.commit(); } catch (e) { console.error(e); toast("サンプルを入れられませんでした"); return; }
+  // 点検は別に入れる（Firebase のルールに点検の場所がまだないときも、ほかのサンプルは入るように）
+  try { const c = writeBatch(db); ckDocs.forEach((x, id) => c.set(doc(db, "checks", id), x)); await c.commit(); toast("サンプルを入れました"); }
+  catch (e) { console.warn("点検のサンプルは入れられませんでした", e); toast("サンプルを入れました（点検の記録は、ルールに点検の場所がないので入れていません）"); }
+}
+
+async function unseed() {
+  if (!confirm("サンプルデータ（サンプルの車と、その車で試しに入れた予約・修理・車検・点検、サンプルの名簿の人）をすべて消します。\n自分で登録した車・名簿の人は消えません。\n\n消しますか？")) return;
+  try {
+    const refs = new Map(); // 同じ記録を2回消さないよう、場所で重複をまとめる
+    const paths = []; // 写真ファイルの場所（車の写真・修理の写真）
+    const add = snap => snap.forEach(d => {
+      refs.set(d.ref.path, d.ref);
+      const x = d.data();
+      paths.push(x.photoPath, x.thumbPath, ...(x.photos || []).flatMap(p => [p.photoPath, p.thumbPath]));
+    });
+    const cars = await getDocs(query(collection(db, "vehicles"), where("sample", "==", true)));
+    const ids = cars.docs.map(d => d.id);
+    for (const c of ["reservations", "repairs", "inspections", "checks"]) {
+      try {
+        add(await getDocs(query(collection(db, c), where("sample", "==", true))));
+        for (let i = 0; i < ids.length; i += 30) add(await getDocs(query(collection(db, c), where("vehicleId", "in", ids.slice(i, i + 30)))));
+      } catch (e) { if (c !== "checks") throw e; console.warn("点検の記録を読めないので、点検は消していません", e); } // ルールに点検の場所がまだないとき
+    }
+    add(cars); // 車は最後に消す（ルールが「サンプルの車の予約か」を確かめるため）
+    const all = [...refs.values()];
+    for (let i = 0; i < all.length; i += 400) {
+      const b = writeBatch(db);
+      all.slice(i, i + 400).forEach(r => b.delete(r));
+      await b.commit();
+    }
+    // サンプルの名簿の人も消す。ルールが古くて消せないときは、隠す（設定の名簿に「隠し中」で残る）
+    const mems = await getDocs(query(collection(db, "members"), where("sample", "==", true)));
+    if (!mems.empty) {
+      const del = writeBatch(db);
+      mems.forEach(d => del.delete(d.ref));
+      try { await del.commit(); } catch (e) {
+        console.warn("サンプルの名簿の人を消せないので隠します", e);
+        const hide = writeBatch(db);
+        mems.forEach(d => hide.update(d.ref, { active: false, updatedAt: serverTimestamp() }));
+        await hide.commit();
+      }
+    }
+    // 写真ファイルも消す（消せなくても続ける）
+    await Promise.all(paths.filter(Boolean).map(p => deleteObject(storageRef(storage, p)).catch(() => {})));
+    toast("サンプルデータを消しました");
+  } catch (e) { console.error(e); toast("消せませんでした"); }
+}
+
+// PCの登録フォームで写真を選んだとき：その場で読み込んで見本を出す（HEIC は JPEG に変換）。読めなければ案内を出して保存させない
+async function pickFormPhoto(input) {
+  const f = input.files && input.files[0]; input.value = ""; if (!f) return;
+  const prev = $("f-prev"), err = $("ferr"), form = $("vform");
+  if (pendingPhoto) URL.revokeObjectURL(pendingPhoto.preview);
+  pendingPhoto = null;
+  err.hidden = true;
+  prev.innerHTML = `<div class="mhero-img empty loading-thumb">写真を読み込んでいます…</div>`;
+  try {
+    const img = await readPhoto(f);
+    let jpeg; try { jpeg = await toJpeg(img, PHOTO_MAX, 0.9); } finally { if (img.close) img.close(); }
+    if ($("vform") !== form) return; // 読み込み中にフォームを閉じた
+    pendingPhoto = { file: jpeg, preview: URL.createObjectURL(jpeg) };
+    prev.innerHTML = formPhotoHtml(pendingPhoto.preview);
+  } catch (e) {
+    console.error(e);
+    if ($("vform") !== form) return;
+    const cur = modalId && byId(modalId); prev.innerHTML = formPhotoHtml(cur && cur.photoUrl, cur); loadImages(prev);
+    err.textContent = photoErrMsg(e); err.hidden = false;
+  }
+}
+
+/* ---------- 写真を見る画面（画面いっぱい。2本指で拡大・縮小、拡大中は1本指で動かす、2回タップで拡大／戻す） ---------- */
+let viewer = null;
+function openViewer(url) {
+  closeViewer();
+  const el = document.createElement("div");
+  el.className = "viewer"; el.setAttribute("role", "dialog"); el.setAttribute("aria-label", "写真");
+  el.innerHTML = `<img src="${esc(url)}" alt="車の写真" draggable="false"><button type="button" class="vclose" aria-label="閉じる">×</button>`;
+  document.body.appendChild(el);
+  const img = el.querySelector("img");
+  const st = { scale: 1, x: 0, y: 0 }, pts = new Map();
+  let start = null, moved = false, lastTap = 0, onImg = false;
+  const apply = () => { img.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`; };
+  const clamp = v => Math.min(5, Math.max(1, v));
+  const reset = () => { st.scale = 1; st.x = 0; st.y = 0; apply(); };
+  const zoomAt = (ns, cx, cy) => { // 指（マウス）の位置を中心に拡大・縮小
+    const r = el.getBoundingClientRect(), ox = cx - r.width / 2, oy = cy - r.height / 2;
+    ns = clamp(ns); const k = ns / st.scale;
+    st.x = ox - (ox - st.x) * k; st.y = oy - (oy - st.y) * k; st.scale = ns;
+    if (ns === 1) { st.x = 0; st.y = 0; }
+    apply();
+  };
+  el.addEventListener("pointerdown", e => {
+    if (e.target.closest(".vclose")) return;
+    if (!pts.size) onImg = e.target === img;
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* 押さえ続けの登録ができなくても動く */ }
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); moved = false;
+    const p = [...pts.values()];
+    start = p.length >= 2
+      ? { d: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y), scale: st.scale }
+      : { px: e.clientX, py: e.clientY, x: st.x, y: st.y };
+  });
+  el.addEventListener("pointermove", e => {
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const p = [...pts.values()];
+    if (p.length >= 2 && start && start.d) {
+      const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+      zoomAt(start.scale * d / start.d, (p[0].x + p[1].x) / 2, (p[0].y + p[1].y) / 2); moved = true;
+    } else if (p.length === 1 && start && start.px != null && st.scale > 1) {
+      st.x = start.x + e.clientX - start.px; st.y = start.y + e.clientY - start.py; apply();
+      if (Math.abs(e.clientX - start.px) + Math.abs(e.clientY - start.py) > 6) moved = true;
+    } else if (start && start.px != null && Math.abs(e.clientX - start.px) + Math.abs(e.clientY - start.py) > 6) moved = true;
+  });
+  const up = e => {
+    pts.delete(e.pointerId);
+    const p = [...pts.values()];
+    start = p.length === 1 ? { px: p[0].x, py: p[0].y, x: st.x, y: st.y } : null;
+    if (pts.size) return;
+    if (moved) return;
+    // 1本指で押しただけ：2回続けてなら拡大／戻す、背景なら閉じる
+    const now = Date.now();
+    if (onImg && now - lastTap < 320) { st.scale > 1 ? reset() : zoomAt(2.5, e.clientX, e.clientY); lastTap = 0; return; }
+    lastTap = now;
+    if (!onImg) closeViewer();
+  };
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointercancel", e => { pts.delete(e.pointerId); start = null; });
+  el.addEventListener("wheel", e => { e.preventDefault(); zoomAt(st.scale * (e.deltaY < 0 ? 1.2 : 1 / 1.2), e.clientX, e.clientY); }, { passive: false });
+  el.querySelector(".vclose").addEventListener("click", closeViewer);
+  viewer = el;
+  el.querySelector(".vclose").focus();
+}
+function closeViewer() { if (viewer) { viewer.remove(); viewer = null; } }
+
+/* ---------- お知らせ ---------- */
+let toastTimer;
+function toast(msg, kind) {
+  const el = $("toast"); el.textContent = msg; el.hidden = false;
+  el.classList.toggle("err", kind === "err");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; }, kind === "err" ? 8000 : 2600);
+}
+
+/* ---------- 操作 ---------- */
+document.addEventListener("click", e => {
+  const el = e.target.closest("[data-act]");
+  // 名前のメニューは、ほかの所を押したら閉じるだけ（押した所の動きはしない）
+  if (ui.menu && !e.target.closest(".me-menu, .me-pill")) { ui.menu = false; render(); return; }
+  if (!el) return;
+  const { act, id, val } = el.dataset;
+  switch (act) {
+    case "meMenu": ui.menu = !ui.menu; render(); break;
+    case "goNotify": go({ name: "notify" }); break;
+    case "pushOn": enablePush(); break;
+    case "pushTest": sendTestPush(); break;
+    case "setTab": showSetTab(val); break;
+    case "nAll": setNotifyAll(val, id === "on"); break;
+    case "view": lsSet("taiyo_view", val); applyView(); break;
+    case "tab": setTab(val); break;
+    case "filter": ui.filter = val; render(); break;
+    case "pcFilter": pcUi.filter = val; if (val !== "all") pcUi.groups[val] = true; savePcUi(); render(); break; // 状態を選んだら、そのグループを開く
+    case "pcType": pcUi.type = val; savePcUi(); render(); break;
+    case "pcGroup": pcUi.groups[val] = !pcUi.groups[val]; savePcUi(); render(); break;
+    case "pcPanel": pcUi.panels[val] = !pcUi.panels[val]; savePcUi(); render(); break;
+    case "tfilter": ui.tfilter = val; render(); break;
+    case "detail": detMonth = 0; go({ name: "detail", id }); break;
+    case "back": goBack(); break;
+    case "goto": go({ name: val, id }); break;
+    case "me": saveMe(val); break;
+    case "meEdit": go({ name: "me" }); break;
+    case "whoOther": form.other = true; form.picking = true; form.whoQ = ""; form.err = ""; render(); break;
+    case "whoMe": form.other = false; form.picking = false; form.who = ""; form.err = ""; render(); break;
+    case "pickWho": form.who = val; form.picking = false; form.err = ""; render(); break;
+    case "reserve": { const v = byId(id); if (v) doReserve(v); break; }
+    case "rcDay": pickRange(val); break;
+    case "rcClear": if (!form.busy) { form.s = form.e = null; form.days = []; form.rmsg = ""; form.err = ""; render(); } break;
+    // 続けて／飛び飛び を切り替えたら、選んでいた日はいったん消す
+    case "rcMode": if (!form.busy && (val === "multi") !== multi()) { form.mode = val; form.s = form.e = null; form.days = []; form.rmsg = ""; form.err = ""; render(); } break;
+    case "pcPage": pcUi.page = val; savePcUi(); render(); break;
+    case "akiType": akiUi.type = val; lsSet("taiyo_aki_type", val); render(); break;
+    case "akiBlk": akiShowBlock(akiList[Number(val)]); break;
+    case "akiCell": { const r = el.getBoundingClientRect(), i = Math.floor((e.clientX - r.left) / (r.width / AKI_DAYS)); if (i >= 0 && i < AKI_DAYS) akiShowCell(id, i); break; }
+    case "akiCar": akiShowCar(id); break;
+    case "detDay": detPickDay(id, val); break; // 車の詳しい画面のカレンダー：空いている日
+    case "detRes": { const r = S.reservations.find(x => x.id === val); if (r) akiShowBlock({ k: "use", r, late: isOverdue(r) }); break; }
+    case "akiClose": closeSheet(); break;
+    case "akiReserve": hideSheet(); openReserve(id, val); break;
+    case "akiDetail": hideSheet(); detMonth = 0; go({ name: "detail", id }); break;
+    case "cancelRes": cancelReservation(id); break;
+    case "detMonth": detMonth = Math.max(0, Math.min(12, detMonth + Number(val))); render(); break;
+    case "return": { const v = byId(id); if (v) doReturn(v, val, el.dataset.rid); break; }
+    case "myReturn": go({ name: "return", id, rid: val }); break;
+    case "sym": toggleSym(val); break;
+    case "rmPhoto": removeRepairPhoto(Number(val)); break;
+    case "sendRepair": { const v = byId(id); if (v) doRepair(v); break; }
+    case "repairSet": setRepairStatus(id, val); break;
+    case "add": openModal(null); break;
+    case "edit": openModal(id); break;
+    case "close": closeModal(); break;
+    case "viewPhoto": openViewer(val); break;
+    case "settings": openSettings(); break;
+    case "memImport": importFromNippo(); break;
+    case "memToggle": toggleMember(id); break;
+    case "memAdd": addMember(); break;
+    case "itemAdd": itemAdd(val); break;
+    case "itemDel": itemDel(el); break;
+    case "retire": retireVehicle(modalId); break;
+    case "restore": restoreVehicle(id); break;
+    case "avail": break; // 預けられる日の欄（押しても車の修正画面を開かない）
+    case "wishOk": acceptWish(id); break;
+    case "inspOut": openInspOut(id); break;
+    case "inspBack": openInspBack(id); break;
+    case "inspUndo": undoInsp(id); break;
+    case "repairUndo": undoRepair([S.repairs.find(x => x.id === id)]); break;
+    case "repairUndoCar": { const v = byId(id); if (v) undoRepair(repairsOf(v)); break; }
+    case "shkPlus": shakenPlus(val); break;
+    case "hideCar": { const v = byId(modalId); if (v) setHidden(v.id, !v.hidden); break; }
+    case "unhide": setHidden(id, false); break;
+    case "seed": seed(); break;
+    case "unseed": unseed(); break;
+    // 点検
+    case "ckStart": openCheck(id, val === "detail" ? { name: "detail", id } : null); break;
+    case "ckSkip": lsSet(skipKey(id, ymd(today())), "1"); toast("今日は点検しないことにしました"); render(); break;
+    case "ckAns": ckAnswer(id, val); break;
+    case "ckSave": { const v = byId(id); if (v) saveCheck(v); break; }
+    case "ckConfirm": confirmChecks([id]); break;
+    case "ckConfirmOk": { const ids = [...S.checks.values()].filter(c => !c.confirmed && !ngOf(c) && byId(c.vehicleId) && !byId(c.vehicleId).retired).map(c => c.id);
+      if (ids.length && confirm(`問題なしの点検 ${ids.length}件を、まとめて確認済みにしますか？（確認する人：${checker() || "未選択"}）`)) confirmChecks(ids); break; }
+    case "ckRepair": repairFromCheck(id); break;
+    case "ckCar": ckUi.vid = id; lsSet("taiyo_ck_vid", id); render(); break;
+    case "ckAir": setAirTank(id, val === "1"); break;
+    case "ckSeal": setSeal(val, id === "off"); break;
+    case "ckMonth": { const nx = ymAdd(ckUi.ym, Number(val)); if (nx <= ymOf(ymd(today()))) { ckUi.ym = nx; render(); } break; }
+    case "ckPrint": { const v = byId(ckUi.vid); if (v) printSheets([v]); break; }
+    case "ckPrintAll": printSheets(ckCars()); break;
+    case "ckAdd": addCheckItem(); break;
+    case "ckDel": delCheckItem(id); break;
+    case "ckReset": resetCheckItems(); break;
+  }
+});
+// 点検：月末の点検のオン・オフ、PCの「確認する人」・点検表の車、設定の項目（いつ・エアタンク）
+document.addEventListener("change", e => {
+  const el = e.target;
+  if (el.id === "ck-monthly") { const sc = $("ph-screen"), top = sc.scrollTop; cform.monthly = el.checked; cform.err = ""; render(); sc.scrollTop = top; }
+  if (el.dataset && el.dataset.ckwho !== undefined) { ckWho = el.value; lsSet("taiyo_ck_who", ckWho); render(); }
+  if (el.dataset && el.dataset.ckcar !== undefined) { ckUi.vid = el.value; lsSet("taiyo_ck_vid", el.value); render(); }
+  if (el.id === "ck-on") setCheckOn(el.checked);
+  if (el.dataset && el.dataset.ckfreq) editItems(x => (x.id === el.dataset.ckfreq ? { ...x, freq: el.value === "monthly" ? "monthly" : "daily" } : x));
+  if (el.dataset && el.dataset.ckair) editItems(x => (x.id === el.dataset.ckair ? { ...x, air: el.checked } : x));
+});
+document.addEventListener("input", e => {
+  if ((e.target.dataset && e.target.dataset.ckmemo) || e.target.id === "ck-meter") { // 入れ直したら、前の案内は消す
+    if (cform.err) { cform.err = ""; const f = document.querySelector("#ph-screen .ferr"); if (f) f.remove(); }
+  }
+  if (e.target.dataset && e.target.dataset.ckmemo) cform.memo[e.target.dataset.ckmemo] = e.target.value;
+  if (e.target.id === "ck-meter") { cform.meter = e.target.value; const v = byId(cform.vid), h = $("ck-run"); if (v && h) h.innerHTML = ckRunText(prevMeter(v.id, ymOf(cform.date)), cform.meter); }
+});
+document.addEventListener("keydown", e => {
+  if (e.key !== "Enter") return;
+  if (/^ckadd-/.test(e.target.id)) { e.preventDefault(); addCheckItem(); }
+  if (e.target.id === "site-new" || e.target.id === "lot-new") { e.preventDefault(); itemAdd(e.target.id.split("-")[0]); }
+});
+document.addEventListener("change", e => {
+  const el = e.target;
+  if (el.id === "r-photo") { // 修理を頼む：写真をつける（複数OK）
+    addRepairPhotos(el.files); el.value = "";
+  }
+  if (el.dataset && el.dataset.photo) { // スマホの車両詳細の「📷 写真を登録」
+    const f = el.files && el.files[0]; el.value = "";
+    if (f) setVehiclePhoto(el.dataset.photo, f);
+  }
+  if (el.id === "io-from" || el.id === "io-until") resetInspConfirm(); // 車検に出す：日付を変えたら確認し直す
+  if (el.id === "f-photo") pickFormPhoto(el); // PCの登録フォーム（保存を押したときに送る）
+  if (el.dataset && el.dataset.avail) setAvail(el); // PC：車検が近い車の「預けられる日」
+  if (el.dataset && el.dataset.ntype) setNotify(el.dataset.ntype, [el.dataset.name], el.checked); // PCの設定 → 通知
+  if (el.dataset && el.dataset.pref) setMyPref(el.dataset.pref, el.checked); // スマホの「🔔 通知」
+});
+// 設定画面：名簿・通知の検索、追加欄で Enter を押したとき
+document.addEventListener("input", e => {
+  if (e.target.id === "memSearch") { memQuery = e.target.value; renderMemberList(); }
+  if (e.target.id === "nSearch") { nQuery = e.target.value; renderNotifyTable(); }
+});
+document.addEventListener("keydown", e => {
+  if (e.key !== "Enter" || !e.target.id) return;
+  if (e.target.id === "memSearch" || e.target.id === "nSearch") e.preventDefault();
+  if (/^madd-/.test(e.target.id)) { e.preventDefault(); addMember(); }
+});
+document.addEventListener("submit", e => {
+  if (e.target.id === "vform") { e.preventDefault(); saveVehicle(e.target); }
+  if (e.target.id === "sform") { e.preventDefault(); saveSettings(e.target); }
+  if (e.target.id === "ioform") { e.preventDefault(); saveInspOut(e.target); }
+  if (e.target.id === "ibform") { e.preventDefault(); saveInspBack(e.target); }
+});
+// 予約フォームの入力を覚えておく（スマホの画面と、PCの予約の小さな画面）
+const inResForm = el => (ui.view === "phone" ? $("ph-screen").contains(el) : !!el.closest(".rmodal"));
+document.addEventListener("input", e => {
+  if (e.target.id === "meSearch") { meQuery = e.target.value; $("meList").innerHTML = nameChips(meQuery, ME, "me"); return; }
+  if (e.target.id === "whoSearch") { form.whoQ = e.target.value; $("whoList").innerHTML = nameChips(form.whoQ, form.who, "pickWho"); return; }
+  const n = e.target.name;
+  if (ui.view === "phone" && ui.screen.name === "repair" && n === "memo") rform.memo = e.target.value;
+  if (ui.view === "phone" && ui.screen.name === "repair" && n === "avail") rform.avail = e.target.value;
+  if (resOpen() && inResForm(e.target) && ["who", "site", "siteOther"].includes(n)) form[n] = e.target.value;
+});
+document.addEventListener("change", e => {
+  if (!resOpen() || !inResForm(e.target)) return;
+  const n = e.target.name;
+  if (form.err) { form.err = ""; if (n !== "site") render(); } // 直したら古いエラーは消す
+  if (n === "site") { form.site = e.target.value; render(); } // 「その他」なら入力欄を出す
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Enter" && e.target.matches && e.target.matches(".li.tap, .a-name")) e.target.click();
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches("tr.grp[data-act]")) { e.preventDefault(); e.target.click(); }
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { if (viewer) closeViewer(); else if (sheetOpen()) closeSheet(); else if (!$("modal").hidden) closeModal(); }
+  if (e.key === "Enter" && e.target.matches && e.target.matches(".zoomable")) e.target.click();
+});
+document.addEventListener("toggle", e => {
+  if (!e.target.matches) return;
+  if (e.target.matches("details.hiddenv")) ui.hiddenOpen = e.target.open;
+  else if (e.target.matches("details.retired")) ui.retiredOpen = e.target.open;
+}, true);
+wide.addEventListener("change", applyView);
+// 端末の「戻る」：写真を開いていれば閉じる。一覧以外ならアプリの「‹」と同じ。一覧なら何もしない（アプリが閉じる）
+addEventListener("popstate", () => {
+  // 履歴を外し終わったあとも、一覧の位置を合わせ直す（空き表の小さな画面を閉じたときは、今の位置のまま）
+  if (ignorePop) { const k = ignorePop; ignorePop = false; if (k !== "sheet") applyListPos(); return; }
+  if (sheetOpen()) { closeSheet(true); return; } // 空き表で押して出た小さな画面を閉じる
+  if (ui.view !== "phone" || ui.screen.name === "list") return;
+  if (viewer) { closeViewer(); history.pushState({ sharyo: 1 }, ""); return; }
+  go(ui.backTo || { name: "list", restore: true }, true);
+});
+// 前に開いたときの履歴が残っていたら外す（アプリは一覧から始まるため）
+if (hasNavEntry()) { ignorePop = true; history.back(); }
+// iPhone のホーム画面アプリは端末の「戻る」がないので、画面の左端から右へなぞったら戻る
+if (isIOS && isStandalone()) {
+  let sx = null, sy = 0;
+  document.addEventListener("touchstart", e => {
+    const t = e.touches[0];
+    sx = e.touches.length === 1 && t.clientX < 24 && ui.view === "phone" && (ui.screen.name !== "list" || sheetOpen()) && !viewer ? t.clientX : null;
+    sy = t.clientY;
+  }, { passive: true });
+  document.addEventListener("touchend", e => {
+    if (sx == null) return;
+    const t = e.changedTouches[0];
+    if (t.clientX - sx > 70 && Math.abs(t.clientY - sy) < 60) { if (sheetOpen()) closeSheet(); else goBack(); }
+    sx = null;
+  }, { passive: true });
+}
+// 日付が変わったら表示（使用中／空き）を更新
+let shownDay = ymd(today());
+setInterval(() => { if (ymd(today()) !== shownDay) { shownDay = ymd(today()); render(); } }, 60000);
+
+/* ---------- Firestore と同期（どの端末で変えても、すぐ全員に反映） ---------- */
+function onErr(e) {
+  console.error(e);
+  S.error = e.code === "permission-denied"
+    ? "データを読む権限がありません（Firebase のルール設定を確認してください）"
+    : "データを読み込めませんでした。電波のよい所でもう一度開いてください";
+  render();
+}
+const snapList = snap => snap.docs.map(d => ({ id: d.id, ...d.data({ serverTimestamps: "estimate" }) }));
+let started = false;
+function startSync() {
+  if (started) return; started = true;
+  const loaded = new Set();
+  const done = k => { loaded.add(k); S.ready = loaded.size >= 3; S.error = ""; refresh(); };
+  onSnapshot(collection(db, "vehicles"), snap => {
+    S.vehicles = snapList(snap).sort((a, b) => millis(a.createdAt) - millis(b.createdAt));
+    done("v"); renderCheckCars(); // 設定の「点検」を開いていれば、車の一覧も新しく
+  }, onErr);
+  onSnapshot(query(collection(db, "reservations"), where("returnedAt", "==", null)), snap => {
+    S.reservations = snapList(snap).filter(r => !r.canceled); done("r"); // 取り消した予約は使わない
+  }, onErr);
+  onSnapshot(collection(db, "repairs"), snap => { S.repairs = snapList(snap); done("p"); }, onErr);
+  onSnapshot(collection(db, "members"), snap => {
+    S.members = snapList(snap); S.membersLoaded = true;
+    refresh(); renderMemberList();
+  }, e => { console.warn("名簿を読めません", e); S.membersLoaded = true; refresh(); });
+  onSnapshot(doc(db, "settings", "app"), d => {
+    S.settingsExists = d.exists();
+    S.settings = { ...DEFAULT_SETTINGS, ...(d.data() || {}) };
+    if (checkOn()) startCheckSync(); // 点検表がオンになったら、点検の記録を読み始める
+    refresh(); renderCheckSettings();
+  }, onErr);
+  // 通知：届ける人（PC）・本人のオフ（スマホ）・許可した端末がある人
+  const nwarn = e => console.warn("通知の設定を読めません", e);
+  onSnapshot(doc(db, "settings", "notify"), d => { S.notify = d.data() || {}; S.notifyLoaded = true; refresh(); renderNotifyTable(); }, nwarn);
+  onSnapshot(collection(db, "notifyPrefs"), snap => {
+    S.prefs = new Map(snap.docs.map(d => [d.get("name"), new Set(d.get("off") || [])])); refresh();
+  }, nwarn);
+  onSnapshot(collection(db, "shopUsers"), snap => {
+    S.shopUsers = [...new Set(snap.docs.map(d => d.get("name")).filter(Boolean))]; renderNotifyTable();
+  }, nwarn);
+  onSnapshot(collection(db, "pushTokens"), snap => {
+    S.tokens = snap.docs.map(d => { const t = d.get("updatedAt"); return { id: d.id, name: d.get("name"), platform: d.get("platform"), at: t && t.toMillis ? t.toMillis() : 0 }; });
+    S.tokenIds = new Set(S.tokens.map(t => t.id));
+    S.tokenNames = new Set(S.tokens.map(t => t.name).filter(Boolean)); renderNotifyTable();
+    if (ui.view === "phone" && ui.screen.name === "notify") render();
+  }, nwarn);
+  // 許可済みの端末は、開くたびにトークンを取り直して保存する。サーバーで無効として消されていたら、古い登録を捨てて取り直す
+  if (ME && pushState() === "on") checkMyPush().catch(e => console.warn(e));
+}
+
+applyView();
+// ホーム画面に追加して使えるように（PWA）
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(e => console.warn(e));
+onAuthStateChanged(auth, user => { if (user) startSync(); });
+signInAnonymously(auth).catch(e => {
+  console.error(e);
+  S.error = e.code === "auth/unauthorized-domain"
+    ? "このアドレスが Firebase に登録されていません（承認済みドメインを追加してください）"
+    : "接続できませんでした。電波のよい所でもう一度開いてください";
+  render();
+});
