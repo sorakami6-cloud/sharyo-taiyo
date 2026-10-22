@@ -1,6 +1,6 @@
 // 整備工場用アプリ（shop/）の service worker。この shop/ フォルダの中だけで働く。中身は ../sw-core.js（社員用と同じ）
 self.SW = {
-  cache: "taiyo-shop-v30", // 版を上げると、スマホに保存した古い画面・アイコンを入れ替える（app/app.js の APP_VERSION と同じ番号）
+  cache: "taiyo-shop-v31", // 版を上げると、スマホに保存した古い画面・アイコンを入れ替える（app/app.js の APP_VERSION と同じ番号）
   prefix: "taiyo-shop-",   // この名前で始まる古い保存だけを消す
   title: "おまかせ車庫番 整備", // 通知の題（題がないとき）
   icon: "../icons/shop-icon-192.png?v=1",
