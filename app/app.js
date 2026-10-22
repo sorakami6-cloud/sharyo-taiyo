@@ -36,7 +36,7 @@ const db = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabMa
 const storage = getStorage(fbApp);
 
 /* ---------- 定数 ---------- */
-const APP_VERSION = "30"; // 版の番号（名前のメニューの下に出す）。app/sw.js・shop/sw.js の CACHE（taiyo-app-v○○・taiyo-shop-v○○）と同じ番号にする
+const APP_VERSION = "31"; // 版の番号（名前のメニューの下に出す）。app/sw.js・shop/sw.js の CACHE（taiyo-app-v○○・taiyo-shop-v○○）と同じ番号にする
 const TYPES = ["トラック", "バン", "普通車"];
 const SHOP_NAME = COMPANY.shopName || "整備工場"; // 整備工場の名前。専用ページは shop/
 // 見本か。見本では、サンプルの車も空き表・整備工場の画面に出す（会社用では出さない）
@@ -2328,9 +2328,10 @@ const ymJp = s => { const [y, m] = String(s || "").split("-").map(Number); retur
 const surname = n => String(n || "").split(/[\s　]+/)[0];
 const plate4 = v => String(v.plateNum || "").replace(/\D/g, "").slice(-4) || String(v.plateNum || "");
 const driverOf = v => v.driver || v.owner || "";
-// 点検表の確認の欄。所長・所長代理・実施者は、車に月ごとに残す（seals）。チェック者は、その月の点検を全部確認したら入る
-// 実施者は、印がなければ月末の点検をした人
-const SEALS = [["boss", "所長"], ["deputy", "所長代理"], ["checker", "チェック者"], ["doer", "実施者"]];
+// 点検表の確認の欄。チェック者は、その月の点検を全部確認したら入る
+// TAIYO様は「チェック者」だけ（所長・所長代理・実施者の欄は出さない。2026-10-23 k さん）
+// 欄をもどすときは ["boss", "所長"], ["deputy", "所長代理"], ["doer", "実施者"] を足す（車に月ごとに残す seals のしくみはそのまま）
+const SEALS = [["checker", "チェック者"]];
 // 点検表に出すもの（画面と印刷で同じ）
 function sheetData(v, ym, recs) {
   const [y, m] = ym.split("-").map(Number), nd = new Date(y, m, 0).getDate();

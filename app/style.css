@@ -940,7 +940,7 @@ input[type="search"]::-webkit-search-decoration{-webkit-appearance:none}
 .cks-facts span{font-size:13px;color:var(--mute)}
 .cks-facts b{font-size:19px;font-weight:900;overflow-wrap:anywhere}
 .cks-facts b small{display:block;font-size:13px;font-weight:700;color:var(--mute)}
-.cks-seals{flex:1 1 auto;display:flex;border:1.5px solid var(--line-strong);border-radius:10px;overflow:hidden}
+.cks-seals{flex:0 0 auto;display:flex;border:1.5px solid var(--line-strong);border-radius:10px;overflow:hidden}
 .cks-seals > div{width:100px;display:flex;flex-direction:column;border-right:1.5px solid var(--line-strong)}
 .cks-seals > div:last-child{border-right:0}
 .cks-seals .sl{padding:5px 0;text-align:center;font-size:13px;font-weight:700;background:var(--bg);border-bottom:1.5px solid var(--line-strong)}
