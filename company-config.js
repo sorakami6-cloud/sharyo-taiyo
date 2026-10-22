@@ -29,7 +29,7 @@ export const COMPANY = {
   nippoUrl: "",
 
   // 点検表をつかうか（最初の値。あとから PC の「設定 → 点検」で変えられます）
-  checkOn: true,
+  checkOn: false,
 
   // 見本（デモ）か。true なら、サンプルの車も空き表・整備工場の画面に出します
   // 会社用は false にします
